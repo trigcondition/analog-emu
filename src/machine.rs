@@ -1195,15 +1195,15 @@ impl Machine {
             return false;
         }
         if pc == p.sysex_send {
-            // A SysEx reply for USB (interface 2 or 4) goes out of the emulated
-            // MIDI port instead of the unmodelled USB controller.
+            // A SysEx reply for USB (interface 2 or 4) goes to the USB MIDI
+            // output instead of the unmodelled USB controller, and only there:
+            // a reply to a USB request does not appear on the DIN MIDI port.
             let sp = self.cpu.a[7];
             let bus = &self.cpu.bus;
             let iface = bus.peek32(sp + 16);
             if iface == 2 || iface == 4 {
                 let (buf, len) = (bus.peek32(sp + 4), bus.peek32(sp + 8));
                 let bytes = bus.peek_bytes(buf, len.min(1 << 20) as usize);
-                self.cpu.bus.io.midi_out.extend(bytes.iter().copied());
                 self.usb_out(&bytes);
                 self.cpu.d[0] = 1;
                 self.cpu.pc = self.cpu.bus.peek32(sp);
