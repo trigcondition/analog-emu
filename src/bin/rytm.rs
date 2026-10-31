@@ -1,7 +1,7 @@
 //! The emulator in a window, with sound: Analog Rytm MKII by default, or the Digitakt
 //! or Analog Four MKII (pass its .syx). Built a second time as `a4` (src/bin/a4.rs),
 //! which defaults to the A4 OS 1.56 and the card a4.img. The window draws the
-//! loaded device's front panel (`gui::hw`; the Digitakt keeps the plain one).
+//! loaded device's front panel (`gui::hw`).
 //!
 //!     rytm [FIRMWARE.syx] [--snapshot FILE] [--ips N] [--no-audio]
 //!              [--headless --after SECS --screenshot OUT.png] [--press CODE@SECS[:HOLD]]
@@ -243,6 +243,11 @@ fn view_of(m: &Machine, status: String) -> View {
     }
 }
 
+/// The machines whose USB MIDI port has virtual ports: the Digitakt's needs --usb-host to carry anything.
+fn usb_ports(m: &Machine) -> bool {
+    m.is_rytm() || m.is_a4() || m.prof.device == dtemu::symbols::Device::Digitakt
+}
+
 /// The emulator loop. Runs until `quit`.
 fn emulate(
     mut m: Machine,
@@ -261,7 +266,7 @@ fn emulate(
     // so a second emulator can run beside a window without their ports colliding.
     let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else if m.is_syntakt() { "syntakt-emu" } else { "rytm-emu" }.into());
     let mut midi_out = if ports { midi::Out::start(&format!("{pname} out"), "out") } else { None };
-    let mut usb_out = if ports && (m.is_rytm() || m.is_a4()) { midi::Out::start(&format!("{pname} usb out"), "uout") } else { None };
+    let mut usb_out = if ports && usb_ports(&m) { midi::Out::start(&format!("{pname} usb out"), "uout") } else { None };
     let slice = (ips / 500.0) as u64; // 2 ms of emulated time
     let target_ms = o.latency;
     let mut t0 = Instant::now();
@@ -708,13 +713,12 @@ pub fn main() {
     // The same names as the output ports.
     let pname = std::env::var("DTEMU_MIDI_NAME").unwrap_or_else(|_| if m.is_a4() { "a4-emu" } else if m.is_syntakt() { "syntakt-emu" } else { "rytm-emu" }.into());
     let _midi_in = if ports { midi::start_in(tx.clone(), &format!("{pname} in"), false) } else { None };
-    let _usb_in = if ports && { let v = view.lock().unwrap(); v.rytm || v.a4 } { midi::start_in(tx.clone(), &format!("{pname} usb in"), true) } else { None };
+    let _usb_in = if ports && usb_ports(&m) { midi::start_in(tx.clone(), &format!("{pname} usb in"), true) } else { None };
     // --midi-from NAME: an existing MIDI source (a real Rytm, a keyboard) into
     // the DIN MIDI input, without a routing app.
     let _from = o.midi_from.as_deref().and_then(|n| midi::connect_from(tx.clone(), n));
     if let Some(addr) = &o.usb_midi_tcp {
-        let usb = { let v = view.lock().unwrap(); v.rytm || v.a4 };
-        if usb {
+        if usb_ports(&m) {
             miditcp::USB.start(addr, tx.clone());
         } else {
             eprintln!("usb midi tcp: this device has no USB MIDI port here");
@@ -885,6 +889,7 @@ fn run_window(o: &Opts, tx: mpsc::Sender<Ev>, view: Arc<Mutex<View>>, _quit: Arc
     // Height on a pad -> force: the top edge 255, the bottom about 30.
     let force_at = |p: &gui::Place, y: f32| -> u8 { (30.0 + 225.0 * (1.0 - ((y - p.y as f32) / p.h as f32).clamp(0.0, 1.0))) as u8 };
     let mut shot_at = o.screenshot.as_ref().map(|_| Instant::now() + Duration::from_secs_f64(o.after));
+    let mut dump = WinDump::from_env();
     while win.is_open() {
         let (mx, my) = win.get_mouse_pos(MouseMode::Discard).unwrap_or((-1.0, -1.0));
         let down = win.get_mouse_down(MouseButton::Left);
@@ -1013,6 +1018,122 @@ fn run_window(o: &Opts, tx: mpsc::Sender<Ev>, view: Arc<Mutex<View>>, _quit: Arc
         }
         if win.update_with_buffer(&cv.px, cv.w, cv.h).is_err() {
             break;
+        }
+        if let Some(d) = dump.as_mut() {
+            d.tick(cv, &v, win.get_window_handle());
+        }
+    }
+}
+
+/// DTEMU_WIN_DUMP=DIR[:SECS]: every SECS (default 5) of the window's life, the
+/// canvas as DIR/canvasNNN.png and, on macOS, what the window server composites
+/// for this window as DIR/windowNNN.png (a process may capture its own window
+/// without the screen recording permission); the status line goes to stderr.
+struct WinDump {
+    dir: PathBuf,
+    every: Duration,
+    next: Instant,
+    n: u32,
+}
+
+impl WinDump {
+    fn from_env() -> Option<WinDump> {
+        let v = std::env::var("DTEMU_WIN_DUMP").ok()?;
+        let (dir, secs) = match v.rsplit_once(':') {
+            Some((d, s)) if s.parse::<f64>().is_ok() => (d.to_string(), s.parse().unwrap()),
+            _ => (v, 5.0),
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let every = Duration::from_secs_f64(secs);
+        Some(WinDump { dir: dir.into(), every, next: Instant::now() + every, n: 0 })
+    }
+
+    fn tick(&mut self, cv: &Canvas, v: &View, nswindow: *mut std::ffi::c_void) {
+        if Instant::now() < self.next {
+            return;
+        }
+        self.next += self.every;
+        self.n += 1;
+        let lit: u32 = v.oled.iter().map(|b| b.count_ones()).sum();
+        eprintln!("dump {:03}: {}  OLED {lit} px on", self.n, v.status);
+        let _ = gui::save_png(cv, &self.dir.join(format!("canvas{:03}.png", self.n)));
+        #[cfg(target_os = "macos")]
+        match mac::capture(nswindow) {
+            Some(c) => {
+                let _ = gui::save_png(&c, &self.dir.join(format!("window{:03}.png", self.n)));
+            }
+            None => eprintln!("dump: the window server gave no image"),
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = nswindow;
+    }
+}
+
+// The window as the window server has it.
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use dtemu::gui::Canvas;
+    use std::ffi::{c_void, CString};
+    type Id = *mut c_void;
+
+    extern "C" {
+        fn objc_msgSend();
+        fn sel_registerName(s: *const std::os::raw::c_char) -> Id;
+        fn dlsym(h: *mut c_void, s: *const std::os::raw::c_char) -> *mut c_void;
+        fn CGImageGetWidth(i: Id) -> usize;
+        fn CGImageGetHeight(i: Id) -> usize;
+        fn CGImageGetBytesPerRow(i: Id) -> usize;
+        fn CGImageGetDataProvider(i: Id) -> Id;
+        fn CGImageRelease(i: Id);
+        fn CGDataProviderCopyData(p: Id) -> Id;
+        fn CFDataGetBytePtr(d: Id) -> *const u8;
+        fn CFRelease(o: Id);
+    }
+
+    #[repr(C)]
+    struct Rect(f64, f64, f64, f64);
+
+    const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+    fn sel(name: &str) -> Id {
+        let c = CString::new(name).unwrap();
+        unsafe { sel_registerName(c.as_ptr()) }
+    }
+
+    /// `[win windowNumber]` -> a captured image, BGRA, as a canvas (device pixels).
+    pub fn capture(win: *mut c_void) -> Option<Canvas> {
+        unsafe {
+            let send: unsafe extern "C" fn(Id, Id) -> isize = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            let number = send(win, sel("windowNumber")) as u32;
+            // Obsoleted in the macOS 15 SDK but still in the library: looked up by name.
+            let name = CString::new("CGWindowListCreateImage").unwrap();
+            let f = dlsym(RTLD_DEFAULT, name.as_ptr());
+            if f.is_null() {
+                return None;
+            }
+            let create: unsafe extern "C" fn(Rect, u32, u32, u32) -> Id = std::mem::transmute(f);
+            // CGRectNull, kCGWindowListOptionIncludingWindow, kCGWindowImageBoundsIgnoreFraming.
+            let img = create(Rect(f64::INFINITY, f64::INFINITY, 0.0, 0.0), 8, number, 1);
+            if img.is_null() {
+                return None;
+            }
+            let (w, h, row) = (CGImageGetWidth(img), CGImageGetHeight(img), CGImageGetBytesPerRow(img));
+            let data = CGDataProviderCopyData(CGImageGetDataProvider(img));
+            let p = CFDataGetBytePtr(data);
+            let mut c = Canvas::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let px = (p.add(y * row + x * 4) as *const u32).read_unaligned();
+                    c.px[y * w + x] = px & 0xFF_FFFF;
+                }
+            }
+            CFRelease(data);
+            CGImageRelease(img);
+            Some(c)
         }
     }
 }

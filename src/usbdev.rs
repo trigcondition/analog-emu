@@ -72,3 +72,20 @@ pub fn write(off: u32, size: u32, v: u32, plain: impl Fn(u32) -> u32) -> Option<
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The firmware's setup write must not take the host's VBUS away (the
+    /// Digitakt's and the Rytm's USB stacks start from BSV on a cold boot).
+    #[test]
+    fn otgsc_line_state_is_read_only() {
+        let bsv_and_bsvis = (1 << 11) | (1 << 19);
+        let w = write(OTGSC, 4, 0x0800_0000, |_| bsv_and_bsvis).unwrap();
+        assert_eq!(w, vec![(OTGSC, 0x0800_0000 | bsv_and_bsvis)]);
+        // Writing 1 clears a status bit; the line state stays.
+        let w = write(OTGSC, 4, 1 << 19, |_| bsv_and_bsvis).unwrap();
+        assert_eq!(w, vec![(OTGSC, 1 << 11)]);
+    }
+}

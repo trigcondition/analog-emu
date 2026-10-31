@@ -142,6 +142,8 @@ pub fn led_for_key(code: u8) -> Option<usize> {
     MAP.iter().find(|(_, k)| *k == code).map(|(l, _)| *l as usize)
 }
 
+/// The LED under TRK: lit red in chromatic mode (FUNC + TRK) [measured, OS 1.53].
+pub const DIGITAKT_TRK_LED: usize = 39;
 /// The four pattern-page LEDs, page 1 first.
 pub const PAGE_LEDS: [usize; 4] = [43, 42, 41, 40];
 

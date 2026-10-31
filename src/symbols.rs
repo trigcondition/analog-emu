@@ -8,6 +8,7 @@
 //! the wrong code. 0 means "not found in this image": the hook is not installed.
 
 pub const DT_153_SHA256: &str = "4b47a9507758ca5669ca02ab2c0374d2c04c98aece445408295cc1dcb265c5df";
+pub const DT_154_SHA256: &str = "5c58bf9e3949ef09977c5fc007a61e8d026931f67f1621238379dfb8ee4d31a2";
 pub const AR_174_SHA256: &str = "34cd0c4da8e4b810d1b25284475a99ea53821e2ab7d30a978bf15dc578251f3b";
 pub const AR_173_SHA256: &str = "28d9ef40c895e03f17dfce096543109adaf708947392db72818fc2a412d685d6";
 pub const A4_156_SHA256: &str = "748fec15ddc61bc3ff66047facba74328934c5fb59f427ddaf34a4e2629a474c";
@@ -239,6 +240,7 @@ impl Profile {
             .collect();
         match h.as_str() {
             DT_153_SHA256 => Ok(Self::digitakt_153(h, idle_spins)),
+            DT_154_SHA256 => Ok(Self::digitakt_154(h, idle_spins)),
             AR_173_SHA256 => Ok(Self::rytm_173(h, idle_spins)),
             AR_174_SHA256 => Ok(Self::rytm_174(h, idle_spins)),
             A4_156_SHA256 => Ok(Self::a4_156(h, idle_spins)),
@@ -246,6 +248,18 @@ impl Profile {
             ARMK1_174_SHA256 => Ok(Self::rytm_mk1_174(h, idle_spins)),
             ST_142_SHA256 => Ok(Self::syntakt_142(h, idle_spins)),
             _ => {
+                // A patched Digitakt OS 1.53 (an elekloader build): the caller says so, as the Digitakt's
+                // profile has no code table to check it by. Its hooks must leave the profile's addresses stock.
+                let dt153 = std::env::var_os("DTEMU_DIGITAKT_153").is_some();
+                if dt153 || std::env::var_os("DTEMU_DIGITAKT_154").is_some() {
+                    let mut p = if dt153 { Self::digitakt_153(h, idle_spins) } else { Self::digitakt_154(h, idle_spins) };
+                    p.name = if dt153 { "Digitakt OS 1.53 (modified)" } else { "Digitakt OS 1.54 (modified)" };
+                    // The sender of the digitakt-sidecar notes (the OS's USB MIDI out), the same (len, data) as the
+                    // Rytm's, and at the same address in both OSes: taken by the stand-in when no USB host is attached.
+                    // With `--usb-host` the firmware's own runs (Machine::usb_microframes).
+                    p.usb_midi_send = 0x4000_4990;
+                    return Ok(p);
+                }
                 // A modified image (rytm-mods build): stock code at every
                 // address the profile hooks.
                 let at = |a: u32| (a - MAIN_LOAD) as usize;
@@ -270,7 +284,7 @@ impl Profile {
                     return Ok(p);
                 }
                 Err(format!(
-                    "MAIN OS sha256 {h} has no symbol table here; known: Digitakt OS 1.53, Analog Rytm MKII OS 1.73 and 1.74, Analog Four MKII OS 1.56, and images that keep one of those Rytm or A4 OSes' code at the profile's addresses (vs Rytm 1.73 this one differs at {}; vs Rytm 1.74 at {}; vs A4 1.56 at {})",
+                    "MAIN OS sha256 {h} has no symbol table here; known: Digitakt OS 1.53 and 1.54, Analog Rytm MKII OS 1.73 and 1.74, Analog Four MKII OS 1.56, and images that keep one of those Rytm or A4 OSes' code at the profile's addresses (vs Rytm 1.73 this one differs at {}; vs Rytm 1.74 at {}; vs A4 1.56 at {})",
                     d173.join(", "), d174.join(", "), da4.join(", ")
                 ))
             }
@@ -339,6 +353,44 @@ impl Profile {
             boot_ver: 0,
             boot_ver_flash: 0,
             idle_spins,
+        }
+    }
+
+    /// OS 1.54, matched from 1.53 by tools/xmatch.py, 2026-10-31: every code
+    /// address a unique masked match, every data address unanimous among the
+    /// references that matched [code]; the functions after 0x40080000 moved by
+    /// +0x228, most data by +0x1000, the framebuffer pointers by +0x3b0.
+    /// Boots to the main screen, USB enumerates [measured].
+    fn digitakt_154(sha256: String, idle_spins: Vec<u32>) -> Profile {
+        Profile {
+            name: "Digitakt OS 1.54",
+            flash_read: 0x400E_971A,
+            current_tcb: 0x4399_E798,
+            prio_heads: 0x4399_E758,
+            panel_diff: 0x400E_630A,
+            fb_front: 0x4020_DCA8,
+            fb_back: 0x4020_DCAC,
+            frame_sem: 0x4198_9BE4,
+            display_sem: 0x421C_E06C,
+            completion_sem: 0x421E_E5C8,
+            pend_call: 0x400E_8D24,
+            depack_copy: 0x400E_ACD4,
+            sd_flag: 0x421C_DA10,
+            sd_status: 0x421C_DA40,
+            sd_cmd_sem: 0x421C_DA5C,
+            sd_data_sem: 0x421C_DA54,
+            sd_dma_sem: 0x421C_DA4C,
+            sd_capacity: 0x421C_DA34,
+            uart8_ring_ptr: 0x4060_F820,
+            uart8_consume_idx: 0x4060_F840,
+            transport_state: 0x4199_EC2C,
+            panel_button_names: 0x4018_E554,
+            mounted: 0x420E_EC50,
+            first_boot_error: 0x4064_90E0,
+            progress_done: 0x421C_E4F4,
+            progress_total: 0x421C_E4F0,
+            abort_loop: 0x400E_E61A,
+            ..Self::digitakt_153(sha256, idle_spins)
         }
     }
 
