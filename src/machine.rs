@@ -1189,6 +1189,9 @@ impl Machine {
             let bus = &self.cpu.bus;
             let (len, ptr) = (bus.peek32(sp + 4), bus.peek32(sp + 8));
             let bytes = bus.peek_bytes(ptr, len.min(4096) as usize);
+            if std::env::var_os("DTEMU_USB_SEND_LOG").is_some() {
+                eprintln!("usb send: clock {} len {} cmd {:02x}", bus.io.now, len, bytes.get(4).copied().unwrap_or(0));
+            }
             self.usb_out(&bytes);
             self.cpu.pc = self.cpu.bus.peek32(sp);
             self.cpu.a[7] = sp + 4;
@@ -1218,6 +1221,12 @@ impl Machine {
     /// Run until the clock reaches `until` or something stops the machine.
     /// Run the simulated USB host for the microframes that are due.
     fn usb_microframes(&mut self) {
+        // The Digitakt: the firmware's own USB stack with a host that reads what it offers (usbhost.rs); the
+        // Rytm keeps its fixed host and stand-ins.
+        if self.prof.device == Device::Digitakt && self.usb_host.as_ref().is_some_and(|h| !h.device_stack) {
+            self.usb_host.as_mut().unwrap().device_stack = true;
+            self.set_usb_midi_real(true);
+        }
         let Some(h) = self.usb_host.as_mut() else { return };
         let io = &mut self.cpu.bus.io;
         if io.usb_uframe.is_none() {
@@ -1229,7 +1238,15 @@ impl Machine {
         for _ in 0..n {
             h.microframe(&mut self.cpu.bus, &mut self.ob_in);
         }
-        let midi: Vec<u8> = h.midi_out.drain(..).collect();
+        let midi: Vec<u8> = std::mem::take(&mut h.midi_out);
+        if let Some(n) = h.ack {
+            let mut a = vec![0u8; n.max(2)];
+            a[0] = 0xF0;
+            a[n.max(2) - 1] = 0xF7;
+            for _ in midi.iter().filter(|&&b| b == 0xF7) {
+                h.midi_send(&a);
+            }
+        }
         // The Rytm's outputs go to the link's host; without one they are dropped.
         if let Some(l) = self.ob_link.as_ref() {
             if h.from_rytm.len() >= 32 {
@@ -1238,6 +1255,13 @@ impl Machine {
             }
         }
         if !midi.is_empty() {
+            // As the stand-in's log (DTEMU_USB_SEND_LOG): here, the moment the host read each message off the bus.
+            if std::env::var_os("DTEMU_USB_SEND_LOG").is_some() {
+                for (k, _) in midi.iter().enumerate().filter(|(_, &b)| b == 0xF0) {
+                    let len = midi[k..].iter().position(|&b| b == 0xF7).map_or(midi.len() - k, |e| e + 1);
+                    eprintln!("usb send: clock {} len {len} cmd {:02x}", self.cpu.bus.io.now, midi.get(k + 4).copied().unwrap_or(0));
+                }
+            }
             self.usb_out(&midi);
         }
     }
@@ -1462,7 +1486,7 @@ impl Machine {
         }
         let side = core.bus.io.dsp_side.as_mut().unwrap();
         std::mem::swap(&mut link.mbox, &mut side.mbox);
-        let edges: Vec<u64> = side.irq_edges.drain(..).collect();
+        let edges: Vec<u64> = std::mem::take(&mut side.irq_edges);
         for t in edges {
             link.raise(t, 0);
         }
@@ -1773,6 +1797,10 @@ impl Machine {
     pub fn usb_midi_send(&mut self, bytes: &[u8]) {
         if self.prof.usb_midi_queue != 0 {
             self.cpu.bus.io.usb_midi_send(bytes);
+        } else if self.prof.device == Device::Digitakt {
+            if let Some(h) = self.usb_host.as_mut() {
+                h.midi_send(bytes);
+            }
         }
     }
 

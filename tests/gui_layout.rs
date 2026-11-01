@@ -60,6 +60,28 @@ fn hardware_layouts() {
     check("Rytm MKII", &places, &panel::RYTM_KEYS, 9);
     render(true, false, false, &places);
 
+    // The Digitakt: the tables are the default too, and its keys are the upstream
+    // control codes 1..47; every one is on the window, by name.
+    let places = gui::layout_for(false, false, false);
+    let mut codes: Vec<u8> = places
+        .iter()
+        .filter_map(|p| match p.c {
+            Control::Key(c) => Some(c),
+            Control::Knob(_, push) => push,
+        })
+        .collect();
+    codes.sort();
+    assert_eq!(codes, (1..48).collect::<Vec<u8>>(), "Digitakt: keys");
+    assert!(codes.iter().all(|&c| panel::key_name(c).is_some()), "Digitakt: a key without a name");
+    assert_eq!(places.iter().filter(|p| matches!(p.c, Control::Knob(..))).count(), 9, "Digitakt: encoders");
+    for (i, p) in places.iter().enumerate() {
+        assert_eq!(places.iter().position(|q| q.hit(p.x + p.w / 2, p.y + p.h / 2)), Some(i), "Digitakt: place {i}");
+        for q in &places[i + 1..] {
+            assert!(!(p.x < q.x + q.w && q.x < p.x + p.w && p.y < q.y + q.h && q.y < p.y + p.h), "Digitakt: places overlap at ({}, {})", p.x, p.y);
+        }
+    }
+    render(false, false, false, &places);
+
     panel::use_a4_panel();
     let places = gui::layout_for(false, true, false);
     check("A4 MKII", &places, &panel::A4_KEYS, 11);

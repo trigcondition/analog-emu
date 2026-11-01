@@ -14,6 +14,15 @@
 //! advances the overlay and, with IOC, sets the endpoint's EPCOMPLETE bit and
 //! USBSTS.UI. The controller interrupts on INTC2 source 17 (vector 209,
 //! handler 0x400040ae in OS 1.73) [measured].
+//!
+//! `device_stack` (the Digitakt, `Machine::usb_microframes`): the host reads the
+//! configuration descriptor instead of assuming the Rytm's, so all of a USB
+//! CONFIG mode's interfaces come up as the firmware offers them; it comes back
+//! when the firmware leaves the bus and returns (USBCMD.RS, on a mode change);
+//! MIDI goes to the device on the bulk OUT endpoint; the Overbridge OUT stream
+//! takes the descriptor's packet size (Digitakt: 88 bytes, 2 channels), and the
+//! vendor interface's interrupt IN (0x82) is read. Off, the Rytm's fixed host
+//! runs exactly as before; the Rytm's USB MIDI input stays the OS queue stand-in.
 
 use std::collections::VecDeque;
 
@@ -45,6 +54,111 @@ const OTG_BSVIS: u32 = 1 << 19;
 pub const OB_FRAMES_PER_BLOCK: usize = 7;
 pub const OB_CHANNELS: usize = 12;
 pub const OB_BLOCK: usize = 32 + OB_FRAMES_PER_BLOCK * OB_CHANNELS * 4; // 368
+
+/// What a configuration descriptor asks of a host (`UsbHost::device_stack`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConfigInfo {
+    /// Vendor (Overbridge) interfaces with alternate settings: (interface, the
+    /// alternate with the largest packet), as Overwitch takes alt 3 on 1 and 2.
+    pub alts: Vec<(u8, u8)>,
+    /// That alternate's interrupt packet sizes: endpoint 0x83 IN, 0x03 OUT.
+    pub ob_in_packet: usize,
+    pub ob_out_packet: usize,
+}
+
+/// Walk a configuration descriptor (USB 2.0, 9.6): interfaces, their alternate
+/// settings and endpoints; anything else is skipped by its length.
+pub fn parse_config(d: &[u8]) -> ConfigInfo {
+    let mut info = ConfigInfo::default();
+    let (mut iface, mut alt, mut class) = (0u8, 0u8, 0u8);
+    let mut o = 0;
+    while o + 2 <= d.len() && d[o] >= 2 && o + d[o] as usize <= d.len() {
+        let x = &d[o..o + d[o] as usize];
+        match x[1] {
+            4 if x.len() >= 9 => (iface, alt, class) = (x[2], x[3], x[5]),
+            5 if x.len() >= 7 && class == 0xFF && alt != 0 && x[3] & 3 == 3 => {
+                let mps = u16::from_le_bytes([x[4], x[5]]) as usize & 0x7FF;
+                let slot = if x[2] & 0x80 != 0 { &mut info.ob_in_packet } else { &mut info.ob_out_packet };
+                // A later alternate wins a tie: alt 3 of the Digitakt's OUT is 88 bytes, as alt 2.
+                let e = info.alts.iter_mut().find(|e| e.0 == iface);
+                match e {
+                    Some(e) if mps >= *slot => {
+                        e.1 = alt;
+                        *slot = mps;
+                    }
+                    Some(_) => {}
+                    None => {
+                        info.alts.push((iface, alt));
+                        *slot = mps;
+                    }
+                }
+            }
+            _ => {}
+        }
+        o += d[o] as usize;
+    }
+    info
+}
+
+/// MIDI bytes to USB-MIDI event packets (USB MIDI 1.0, table 4-1), cable 0: the
+/// parser's state across calls, for a stream cut anywhere (running status, a
+/// SysEx in pieces).
+#[derive(Default)]
+pub struct MidiPacker {
+    status: u8,
+    pend: Vec<u8>,
+    sysex: bool,
+}
+
+impl MidiPacker {
+    fn packet(cin: u8, b: &[u8], out: &mut VecDeque<u8>) {
+        out.push_back(cin);
+        out.extend((0..3).map(|k| b.get(k).copied().unwrap_or(0)));
+    }
+
+    pub fn feed(&mut self, bytes: &[u8], out: &mut VecDeque<u8>) {
+        for &b in bytes {
+            if b >= 0xF8 {
+                Self::packet(0xF, &[b], out); // realtime, anywhere
+            } else if self.sysex {
+                self.pend.push(b);
+                if b == 0xF7 {
+                    Self::packet([5, 6, 7][self.pend.len() - 1], &self.pend, out);
+                    self.pend.clear();
+                    self.sysex = false;
+                } else if self.pend.len() == 3 {
+                    Self::packet(4, &self.pend, out);
+                    self.pend.clear();
+                }
+            } else if b == 0xF0 {
+                self.sysex = true;
+                self.status = 0;
+                self.pend = vec![b];
+            } else if b == 0xF6 {
+                self.status = 0;
+                Self::packet(5, &[b], out);
+            } else if b >= 0x80 {
+                self.status = b;
+                self.pend.clear();
+            } else if self.status != 0 {
+                if self.pend.is_empty() {
+                    self.pend.push(self.status);
+                }
+                self.pend.push(b);
+                let s = self.status;
+                let need = if matches!(s, 0xC0..=0xDF | 0xF1 | 0xF3) { 2 } else { 3 };
+                if self.pend.len() == need {
+                    let cin = if s >= 0xF0 { need as u8 } else { s >> 4 };
+                    Self::packet(cin, &self.pend, out);
+                    self.pend.clear();
+                    if s >= 0xF0 {
+                        self.status = 0; // no running status for system common
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// The interrupt line: an enabled USBSTS bit, or an enabled OTGSC status bit.
 pub fn line(bus: &Bus) -> bool {
@@ -149,6 +263,25 @@ pub struct UsbHost {
     /// docs/RYTM-PORT.md) [measured, OS 1.74]. The host writes `cdc_to_device`
     /// and collects `cdc_from_device`; no audio stream runs.
     pub cdc: bool,
+    /// Read the configuration descriptor and follow the firmware on and off
+    /// the bus (module comment). Set by `Machine::usb_microframes`.
+    pub device_stack: bool,
+    /// The host -> device packet of the Overbridge stream and its channels:
+    /// the Rytm's 368 and 12 unless the descriptor says otherwise.
+    out_block: usize,
+    out_channels: usize,
+    /// MIDI to the device: USB-MIDI packets for bulk OUT 0x01 (`midi_send`).
+    midi_to_device: VecDeque<u8>,
+    packer: MidiPacker,
+    /// RS seen set since the last bus reset (`device_stack`).
+    was_running: bool,
+    /// Read MIDI IN only every this many microframes, one dTD a time (a host
+    /// that drains slower than the device sends); 0: as before, up to 8 a
+    /// microframe. `--usb-host-midi-every N`.
+    pub midi_every: u64,
+    /// Answer every SysEx the device sends with one of this many bytes, a
+    /// peer that acknowledges each message (`--usb-host-ack N`, `device_stack`).
+    pub ack: Option<usize>,
     pub cdc_to_device: VecDeque<u8>,
     pub cdc_from_device: Vec<u8>,
     pub stats: UsbStats,
@@ -167,6 +300,10 @@ pub struct UsbStats {
     pub midi_asleep: u64,
     /// OUT frames sent as silence because the Overbridge link had none queued (oblink.rs).
     pub out_underruns: u64,
+    /// `device_stack`: USB-MIDI packets into bulk OUT, and bytes read from the
+    /// Overbridge vendor interface's interrupt IN 0x82.
+    pub midi_packets_out: u64,
+    pub vendor_in_bytes: u64,
     /// Host restarts (`gone` windows left) and enumerations completed.
     pub restarts: u64,
     pub enumerations: u64,
@@ -202,6 +339,14 @@ impl UsbHost {
             midi_out: Vec::new(),
             gpt: [None, None],
             cdc: false,
+            device_stack: false,
+            out_block: OB_BLOCK,
+            out_channels: OB_CHANNELS,
+            midi_to_device: VecDeque::new(),
+            packer: MidiPacker::default(),
+            was_running: false,
+            midi_every: 0,
+            ack: None,
             cdc_to_device: VecDeque::new(),
             cdc_from_device: Vec::new(),
             stats: UsbStats::default(),
@@ -210,6 +355,12 @@ impl UsbHost {
 
     pub fn streaming(&self) -> bool {
         self.phase == Phase::Stream
+    }
+
+    /// MIDI to the device, on its bulk OUT endpoint as a USB host sends it
+    /// (`device_stack` only; the Rytm's goes through the OS queue stand-in).
+    pub fn midi_send(&mut self, bytes: &[u8]) {
+        self.packer.feed(bytes, &mut self.midi_to_device);
     }
 
     fn say(&self, s: &str) {
@@ -276,6 +427,24 @@ impl UsbHost {
             self.stats.midi_asleep += 1;
             return;
         }
+        if self.device_stack {
+            // RS off is the firmware's pull-up gone (a USB CONFIG change, 0x4000601a on the Digitakt): a real host
+            // sees a disconnect, then a new device when RS comes back, and enumerates it again.
+            if running {
+                self.was_running = true;
+            } else if self.was_running {
+                self.was_running = false;
+                self.phase = Phase::Vbus;
+                self.t = now;
+                self.queue.clear();
+                self.ctl = None;
+                self.credit = 0;
+                self.in_budget = 0;
+                self.device_desc.clear();
+                self.config_desc.clear();
+                self.say("device left the bus");
+            }
+        }
         match self.phase {
             Phase::Idle => {
                 // Cable in: VBUS valid (B session) and its interrupt.
@@ -331,6 +500,11 @@ impl UsbHost {
                     self.stream(bus, to_rytm);
                     if self.midi_in {
                         self.midi(bus);
+                    }
+                    if self.device_stack {
+                        self.midi_out(bus);
+                        let (b, _) = self.run_dtds(bus, 2, true, &[]);
+                        self.stats.vendor_in_bytes += b.len() as u64;
                     }
                 }
             }
@@ -539,6 +713,19 @@ impl UsbHost {
                 self.queue.push_front([0x80, 6, 0, 2, 0, 0, t[0], t[1]]);
             } else {
                 self.config_desc = c.got.clone();
+                if self.device_stack {
+                    let info = parse_config(&c.got);
+                    if info.ob_out_packet > 32 {
+                        self.out_block = info.ob_out_packet;
+                        self.out_channels = (info.ob_out_packet - 32) / (4 * OB_FRAMES_PER_BLOCK);
+                    }
+                    self.say(&format!("configuration: {info:?}"));
+                    self.queue.push_back([0x00, 9, 1, 0, 0, 0, 0, 0]);
+                    for (i, a) in info.alts {
+                        self.queue.push_back([0x01, 11, a, 0, i, 0, 0, 0]);
+                    }
+                    return;
+                }
                 for s in [
                     [0x00, 9, 1, 0, 0, 0, 0, 0],  // SET_CONFIGURATION 1
                     [0x01, 11, 3, 0, 1, 0, 0, 0], // SET_INTERFACE 1, alt 3 (audio in)
@@ -596,13 +783,18 @@ impl UsbHost {
             let v = bus.peek32(EPNAK) | (1 << 17);
             bus.poke32(EPNAK, v);
         }
-        for _ in 0..8 {
+        let reads = match self.midi_every {
+            0 => 8,
+            n if self.uf.is_multiple_of(n) => 1,
+            _ => 0,
+        };
+        for _ in 0..reads {
             let (b, done) = self.run_dtds(bus, 1, true, &[]);
             if !done && b.is_empty() {
                 break;
             }
             self.stats.midi_dtds += 1;
-            for p in b.chunks_exact(4) {
+            for p in b.as_chunks::<4>().0 {
                 // CIN -> bytes in the packet (USB MIDI 1.0, table 4-1).
                 let n = match p[0] & 0x0F {
                     0x5 | 0xF => 1,
@@ -635,6 +827,27 @@ impl UsbHost {
         let n = total.min(512).min(self.cdc_to_device.len());
         let data: Vec<u8> = self.cdc_to_device.drain(..n).collect();
         self.run_dtds(bus, 2, false, &data);
+    }
+
+    /// Bulk OUT 0x01: the waiting USB-MIDI packets, one high-speed packet (512
+    /// bytes) a microframe, into the dTD the firmware keeps primed.
+    fn midi_out(&mut self, bus: &mut Bus) {
+        if self.midi_to_device.is_empty() || bus.peek32(EPSR) & 2 == 0 {
+            return;
+        }
+        let td = Self::next_dtd(bus, Self::qh(bus, 1, false));
+        if td & 1 != 0 {
+            return;
+        }
+        let tok = bus.peek32((td & !0x1F) + 4);
+        if tok & 0x80 == 0 {
+            return;
+        }
+        let total = ((tok >> 16) & 0x7FFF) as usize;
+        let n = total.min(512).min(self.midi_to_device.len()) & !3;
+        let data: Vec<u8> = self.midi_to_device.drain(..n).collect();
+        self.run_dtds(bus, 1, false, &data);
+        self.stats.midi_packets_out += n as u64 / 4;
     }
 
     /// The audio stream: take what the Rytm sends on 0x83, answer on 0x03 with as
@@ -706,12 +919,13 @@ impl UsbHost {
         }
         let total = ((tok >> 16) & 0x7FFF) as usize;
         // One packet (one block) per microframe.
-        let blocks = (total / OB_BLOCK).min(self.credit / OB_FRAMES_PER_BLOCK).clamp(1, 1);
+        let blocks = (total / self.out_block).min(self.credit / OB_FRAMES_PER_BLOCK).clamp(1, 1);
         if self.log && self.stats.out_transfers < 4 {
             eprintln!("usb host: OUT dTD {total} bytes, sending {blocks} blocks");
         }
-        let mut data = vec![0u8; blocks * OB_BLOCK];
-        for blk in data.chunks_mut(OB_BLOCK) {
+        let mut data = vec![0u8; blocks * self.out_block];
+        let out_channels = self.out_channels;
+        for blk in data.chunks_mut(self.out_block) {
             blk[0] = 0x07;
             blk[1] = 0xFF;
             blk[2..4].copy_from_slice(&self.out_counter.to_be_bytes());
@@ -724,8 +938,8 @@ impl UsbHost {
                         [0; OB_CHANNELS]
                     }
                 };
-                for (c, x) in fr.iter().enumerate() {
-                    let o = 32 + 4 * (f * OB_CHANNELS + c);
+                for (c, x) in fr.iter().take(out_channels).enumerate() {
+                    let o = 32 + 4 * (f * out_channels + c);
                     blk[o..o + 4].copy_from_slice(&x.to_be_bytes());
                 }
             }
@@ -735,5 +949,66 @@ impl UsbHost {
         self.run_dtds(bus, 3, false, &data);
         self.stats.out_transfers += 1;
         self.stats.out_frames += (blocks * OB_FRAMES_PER_BLOCK) as u64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packets(chunks: &[&[u8]]) -> Vec<u8> {
+        let (mut p, mut out) = (MidiPacker::default(), VecDeque::new());
+        for c in chunks {
+            p.feed(c, &mut out);
+        }
+        out.into_iter().collect()
+    }
+
+    #[test]
+    fn midi_packets_channel_running_realtime() {
+        assert_eq!(packets(&[&[0x90, 60, 100, 62, 101]]), [9, 0x90, 60, 100, 9, 0x90, 62, 101]);
+        assert_eq!(packets(&[&[0xC3, 5, 6]]), [0xC, 0xC3, 5, 0, 0xC, 0xC3, 6, 0]);
+        // A clock inside a note, the note split across calls.
+        assert_eq!(packets(&[&[0x80, 60], &[0xF8, 0]]), [0xF, 0xF8, 0, 0, 8, 0x80, 60, 0]);
+        assert_eq!(packets(&[&[0xF2, 1, 2, 0xF6]]), [3, 0xF2, 1, 2, 5, 0xF6, 0, 0]);
+    }
+
+    #[test]
+    fn midi_packets_sysex_each_end() {
+        assert_eq!(packets(&[&[0xF0, 0xF7]]), [6, 0xF0, 0xF7, 0]);
+        assert_eq!(packets(&[&[0xF0, 1, 0xF7]]), [7, 0xF0, 1, 0xF7]);
+        assert_eq!(packets(&[&[0xF0, 1, 2, 0xF7]]), [4, 0xF0, 1, 2, 5, 0xF7, 0, 0]);
+        assert_eq!(packets(&[&[0xF0, 1], &[2, 3, 0xF7]]), [4, 0xF0, 1, 2, 6, 3, 0xF7, 0]);
+    }
+
+    /// The Digitakt's OVERBRIDGE configuration, its shape as the firmware
+    /// gives it: IN alt 3 packs 12 channels, OUT alt 3 two, MIDI is not touched.
+    #[test]
+    fn config_takes_the_largest_vendor_alternate() {
+        let ifd = |n, a, class| vec![9, 4, n, a, 1, class, 0, 0, 0];
+        let ep = |e, attr, mps: u16| vec![7, 5, e, attr, mps as u8, (mps >> 8) as u8, 1];
+        let mut d = vec![9, 2, 0, 0, 6, 1, 0, 0xC0, 0];
+        for (a, mps) in [(1, 32), (2, 88), (3, 368)] {
+            d.extend(ifd(1, a, 0xFF));
+            d.extend(ep(0x83, 3, mps));
+        }
+        for (a, mps) in [(1, 32), (2, 88), (3, 88)] {
+            d.extend(ifd(2, a, 0xFF));
+            d.extend(ep(0x03, 3, mps));
+        }
+        d.extend(ifd(3, 0, 0xFF));
+        d.extend(ep(0x02, 2, 512));
+        d.extend(ep(0x82, 3, 64));
+        d.extend(ifd(5, 0, 1));
+        d.extend(ep(0x01, 2, 512));
+        let i = parse_config(&d);
+        assert_eq!(i.alts, [(1, 3), (2, 3)]);
+        assert_eq!((i.ob_in_packet, i.ob_out_packet), (368, 88));
+    }
+
+    #[test]
+    fn config_without_vendor_interfaces_asks_for_nothing() {
+        let d = [9, 4, 1, 0, 2, 1, 3, 0, 0, 7, 5, 0x01, 2, 0, 2, 0, 7, 5, 0x81, 2, 0, 2, 0];
+        assert_eq!(parse_config(&d), ConfigInfo::default());
     }
 }

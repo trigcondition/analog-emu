@@ -411,7 +411,7 @@ fn serve(
 ) {
     let _ = w.set_write_timeout(Some(sh.write_timeout));
     let writer = std::thread::spawn(move || {
-        let mut r = w.write_all(&[b'N'].iter().copied().chain((TARGET as u32).to_le_bytes()).collect::<Vec<u8>>());
+        let mut r = w.write_all(&b"N".iter().copied().chain((TARGET as u32).to_le_bytes()).collect::<Vec<u8>>());
         // Ends when this connection's sender is dropped (the host left or was replaced) or a write fails.
         while r.is_ok() {
             let Ok(m) = crx.recv() else { return };
@@ -547,11 +547,11 @@ fn read_host(
                 for f in buf.chunks_exact(per) {
                     let mut fr = [0i32; CHANNELS];
                     if voices {
-                        for (v, b) in f.chunks_exact(2).enumerate() {
+                        for (v, b) in f.as_chunks::<2>().0.iter().enumerate() {
                             fr[VOICE_CH[v]] = (i16::from_le_bytes([b[0], b[1]]) as i32) << 16;
                         }
                     } else {
-                        for (c, b) in f.chunks_exact(4).enumerate() {
+                        for (c, b) in f.as_chunks::<4>().0.iter().enumerate() {
                             fr[c] = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                         }
                     }

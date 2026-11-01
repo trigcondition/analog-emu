@@ -8,6 +8,7 @@
 | Analog Four MKI / Analog Keys | 1.56 | `fw/Analog-Four_Analog-Keys_OS1.56.syx` | `./target/release/rytm fw/Analog-Four_Analog-Keys_OS1.56.syx --card a4mk1.img` |
 | Syntakt (main screen; digital tracks 1-8 and modelled analog tracks 9-12 sound) | 1.42 | `fw/Syntakt_OS1.42.syx` | `./target/release/rytm fw/Syntakt_OS1.42.syx --card syntakt.img` |
 | Digitakt MK1 (upstream) | 1.53 | `fw/Digitakt_OS1.53.syx` | `./target/release/rytm fw/Digitakt_OS1.53.syx` |
+| Digitakt MK1 | 1.54 | `fw/Digitakt_OS1.54.syx` | `./target/release/rytm fw/Digitakt_OS1.54.syx` |
 
 **New to this? Follow [`docs/INSTALL.md`](docs/INSTALL.md)**: a step-by-step guide from installing Rust to the first boot.
 
@@ -138,6 +139,31 @@ LT MT/HT CH/OH CY/CB).
 **Firmware**: stock Analog Rytm MKII OS 1.73 and 1.74, and modified images built from
 them (rytm-mods builds), recognised by keeping stock code where the emulator hooks.
 Use a separate `--snapshot` per firmware image; snapshots do not cross images.
+
+**Checking the window without looking at it**: `DTEMU_WIN_DUMP=DIR[:SECS]` writes the canvas and, on macOS, what the window
+server composites for this window (a process may capture its own window) as PNGs every SECS, with the status line and the lit
+OLED pixels on stderr. It needs a real window, so not for runs beside someone using the Mac; `--headless --screenshot` draws the same canvas without one.
+
+**Digitakt MK1, OS 1.53 and 1.54** (new):
+
+- The firmware's own USB stack runs with `--usb-host`: enumeration from a cold boot, MIDI both ways through the OS's own sender, and
+  the Overbridge stream, see [`docs/DIGITAKT-USB.md`](docs/DIGITAKT-USB.md). None of it was compared with a real Digitakt.
+- OS 1.54 has its own profile.
+- The window draws a hardware-style Digitakt panel.
+- The window has USB MIDI ports on a Digitakt, `rytm-emu usb in/out`, and `--usb-midi-tcp` works there too. They carry MIDI with `--usb-host`.
+- A patched OS boots on the stock profile with `DTEMU_DIGITAKT_153=1` or `DTEMU_DIGITAKT_154=1`. Without `--usb-host`, a stand-in takes the
+  OS's USB MIDI sender.
+- Test peers in `dtboot`: `--usb-host-ack N` answers each SysEx, `--usb-host-midi-every N` reads MIDI slowly, `DTEMU_USB_SEND_LOG=1` logs each
+  message and `DTBOOT_USB_OUT=FILE` keeps them.
+
+To run one:
+
+    ./target/release/dtcard digitakt.img format
+    ./target/release/rytm fw/Digitakt_OS1.53.syx --card digitakt.img --usb-host      # the window, USB host attached
+    ./target/release/dtboot fw/Digitakt_OS1.54.syx --card digitakt.img --usb-host --instr 25G   # no window, prints what enumerated
+    DTEMU_DIGITAKT_153=1 ./target/release/rytm my_patched_os.syx --card digitakt.img --usb-host  # a patched 1.53
+
+A fresh card comes up in USB MIDI mode (`1935:000d`). USB CONFIG set to OVERBRIDGE on the panel leaves the bus and comes back as `1935:0b2c`.
 
 **More I/O** (window options): `--audio-in audio|ext|both` feeds the Mac's default
 input to AUDIO IN (sampling) or EXT IN (the main mix); virtual ports `rytm-emu usb

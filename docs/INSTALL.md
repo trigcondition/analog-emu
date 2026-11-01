@@ -93,6 +93,7 @@ Versions the emulator knows:
 | Analog Four MKI / Analog Keys | 1.56 | `Analog-Four_Analog-Keys_OS1.56.syx` |
 | Syntakt | 1.42 | `Syntakt_OS1.42.syx` |
 | Digitakt MK1 | 1.53 | `Digitakt_OS1.53.syx` |
+| Digitakt MK1 | 1.54 | `Digitakt_OS1.54.syx` |
 
 Another OS version won't start: each version needs its own support in the emulator.
 

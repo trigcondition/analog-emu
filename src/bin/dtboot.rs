@@ -57,7 +57,7 @@ counts (suffixes k, M, G).
   --watch ADDR         log writes to a DDR or SRAM (0x8000....) address (hex;
                        SRAM writes are seen with DTEMU_NO_JIT=1 only)
   --midi-out FILE      write everything sent on MIDI out to FILE
-  --usb-midi HEX@AT    bytes on the USB MIDI port (Rytm)
+  --usb-midi HEX@AT    bytes on the USB MIDI port (Rytm; Digitakt with --usb-host)
   --usb-midi-file F@AT[xN/SPACING]  a file's bytes on the USB MIDI port, N times
   --analog-wav FILE    record the modelled analog voices' mix (Rytm; A4 with its
                        effects' return; Syntakt: tracks 9..12 and the analog FX
@@ -69,12 +69,15 @@ counts (suffixes k, M, G).
   --nudge ENC:DIR[:F|:8]@CLOCK[xN/SPACING]  one value step on an encoder, as the
                        window's arrow keys make it (F: with FUNC held; 8: 8 steps)
   --usb-host           attach a simulated USB host (usbhost.rs): enumerates the
-                       Rytm and, in OVERBRIDGE mode, runs the audio stream
+                       Rytm or Digitakt and, in OVERBRIDGE mode, runs the audio stream
                        (DTEMU_USB_LOG=1 logs it)
   --usb-midi-real      run the firmware's own USB MIDI sender and its request
                        pool: the USB host reads MIDI IN (endpoint 0x81) and the
                        requests complete as it does (needs --usb-host; also
                        DTEMU_USB_MIDI_REAL=1). Lists waits from interrupt level.
+  --usb-host-ack N     (Digitakt) answer every SysEx the device sends with an N-byte
+                       one, on the MIDI bulk OUT endpoint
+  --usb-host-midi-every N  read MIDI IN one dTD each N microframes (a slow host)
   --usb-host-sleep FROM[:TO]  the USB host suspends the bus between these clocks
                        (a sleeping laptop: no SOF, no transfers); no TO: to the end
   --usb-host-noread FROM[:TO]  the host keeps the bus running but stops reading
@@ -154,6 +157,8 @@ fn main() {
     let mut usb_midi_real = false;
     let mut usb_sleep: Option<(u64, u64)> = None;
     let mut usb_noread: Option<(u64, u64)> = None;
+    let mut usb_ack: Option<usize> = None;
+    let mut usb_midi_every = 0u64;
     let mut usb_gone: Vec<(u64, u64)> = Vec::new();
     let mut nudges: Vec<(u64, u8, i8, bool, bool)> = Vec::new();
     let mut usb_wav: Option<String> = None;
@@ -299,6 +304,8 @@ fn main() {
             "--test-mode" => test_mode = true,
             "--power-off" => power_off = Some(num(it.next().unwrap())),
             "--usb-midi-real" => usb_midi_real = true,
+            "--usb-host-midi-every" => usb_midi_every = it.next().map_or(0, |v| v.parse().expect("--usb-host-midi-every N")),
+            "--usb-host-ack" => usb_ack = it.next().map(|v| v.parse().expect("--usb-host-ack N")),
             "--usb-host-gone" => {
                 let v = it.next().unwrap();
                 let (x, y) = v.split_once(':').expect("--usb-host-gone FROM:TO");
@@ -460,6 +467,8 @@ fn main() {
         let mut h = dtemu::usbhost::UsbHost::new();
         h.suspend = usb_sleep;
         h.midi_sleep = usb_noread;
+        h.ack = usb_ack;
+        h.midi_every = usb_midi_every;
         h.gone = usb_gone.clone();
         h.cdc = !serials.is_empty();
         m.usb_host = Some(h);
@@ -738,6 +747,8 @@ fn main() {
                         let mut h = dtemu::usbhost::UsbHost::new();
                         h.suspend = usb_sleep;
                         h.midi_sleep = usb_noread;
+                        h.ack = usb_ack;
+                        h.midi_every = usb_midi_every;
                         h.cdc = !serials.is_empty();
                         m.usb_host = Some(h);
                     }
@@ -846,7 +857,20 @@ fn main() {
         if h.cdc {
             println!("usb serial in ({} bytes):\n{}", h.cdc_from_device.len(), String::from_utf8_lossy(&h.cdc_from_device));
         }
+        let b = &m.cpu.bus;
+        println!("usb regs: cmd {:08x} sts {:08x} intr {:08x} portsc {:08x} otgsc {:08x} mode {:08x} eplist {:08x} epctrl1 {:08x}",
+            b.peek32(0xFC0B_0140), b.peek32(0xFC0B_0144), b.peek32(0xFC0B_0148), b.peek32(0xFC0B_0184), b.peek32(0xFC0B_01A4),
+            b.peek32(0xFC0B_01A8), b.peek32(0xFC0B_0158), b.peek32(0xFC0B_01C4));
         println!("usb host: streaming={} {:?}", h.streaming(), h.stats);
+        if h.device_stack && !h.from_rytm.is_empty() {
+            let mut peak = [0u32; dtemu::usbhost::OB_CHANNELS];
+            for fr in &h.from_rytm {
+                for (p, x) in peak.iter_mut().zip(fr) {
+                    *p = (*p).max(x.unsigned_abs());
+                }
+            }
+            println!("usb host: stream IN, last {} frames, peak per channel {peak:x?}", h.from_rytm.len());
+        }
         println!("usb host: device descriptor {:02x?}", h.device_desc);
         println!("usb host: configuration ({} bytes) {:02x?}", h.config_desc.len(), h.config_desc);
     }
@@ -1073,7 +1097,7 @@ fn read_wav16(path: &str) -> Vec<(f32, f32)> {
         }
         if id == b"data" {
             let d = &b[i + 8..(i + 8 + n).min(b.len())];
-            let s: Vec<f32> = d.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
+            let s: Vec<f32> = d.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
             return s.chunks(chans.max(1)).map(|f| (f[0], *f.get(1).unwrap_or(&f[0]))).collect();
         }
         i += 8 + n + (n & 1);

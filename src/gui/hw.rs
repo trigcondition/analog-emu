@@ -1,8 +1,8 @@
 //! The hardware-style windows: the Analog Four MKII and Analog Rytm MKII (light
 //! grey panel, dark keys), the two MKI units (charcoal panel, light keys,
 //! red secondary labels, single-colour LED dots) and the Syntakt (dark panel,
-//! dark keys, red secondary labels), each laid out after its front panel. The
-//! Digitakt keeps the plain window in `gui`.
+//! dark keys, red secondary labels) and the Digitakt (dark panel, dark keys, orange
+//! secondary labels), each laid out after its front panel.
 //!
 //! Every control is a `Place` (its rectangle is the hit area); how a key is drawn
 //! (key, trig, pad, piano key, round or pill button) and its labels follow from
@@ -19,10 +19,12 @@ pub enum Dev {
     A4Mk1,
     RytmMk1,
     Syntakt,
+    Digitakt,
 }
 
-/// The device a window shows in hardware style, or None (the Digitakt). The
-/// Syntakt is known by its panel tables (`panel::use_syntakt_panel`).
+/// The device a window shows in hardware style: each one's own panel, the Digitakt
+/// when no other is. The Syntakt is known by its panel tables
+/// (`panel::use_syntakt_panel`).
 pub fn dev_of(rytm: bool, a4: bool, mk1: bool) -> Option<Dev> {
     if panel::syntakt_panel() {
         Some(Dev::Syntakt)
@@ -35,7 +37,7 @@ pub fn dev_of(rytm: bool, a4: bool, mk1: bool) -> Option<Dev> {
     } else if rytm {
         Some(Dev::Rytm)
     } else {
-        None
+        Some(Dev::Digitakt)
     }
 }
 
@@ -50,6 +52,7 @@ impl Dev {
             Dev::A4Mk1 => "ANALOG FOUR MKI",
             Dev::RytmMk1 => "ANALOG RYTM MKI",
             Dev::Syntakt => "SYNTAKT",
+            Dev::Digitakt => "DIGITAKT",
         }
     }
 }
@@ -58,6 +61,7 @@ impl Dev {
 pub fn size(dev: Dev) -> (usize, usize) {
     match dev {
         Dev::Syntakt => (1180, 880),
+        Dev::Digitakt => (1036, 880),
         d if d.mk1() => (1180, 650),
         _ => (1180, 710),
     }
@@ -113,6 +117,18 @@ fn theme(dev: Dev) -> Theme {
             knob: 0x1A1C1F,
             led_off: 0x3C3F44,
             shadow: 0x101114,
+        },
+        Dev::Digitakt => Theme {
+            panel: 0x2A2B2E,
+            edge: 0x0E1012,
+            key: 0x35373B,
+            key_text: 0xC4C7CC,
+            key_dim: 0xA4A8AE,
+            label: 0xE8EAEC,
+            sub: 0xF08A24,
+            knob: 0x1A1C1F,
+            led_off: 0x45474C,
+            shadow: 0x121316,
         },
     }
 }
@@ -250,7 +266,60 @@ pub fn layout(dev: Dev) -> Vec<Place> {
         Dev::A4Mk1 => layout_a4mk1(),
         Dev::RytmMk1 => layout_rytmmk1(),
         Dev::Syntakt => layout_syntakt(),
+        Dev::Digitakt => layout_digitakt(),
     }
+}
+
+/// Coordinates of the Digitakt panel drawing (manual OS 1.54, section 3.1, at 2.2x;
+/// the panel is 282..1080 by 320..974) to the window.
+fn dx(px: i32) -> i32 {
+    18 + (px - 282) * 5 / 4
+}
+fn dy(py: i32) -> i32 {
+    38 + (py - 328) * 5 / 4
+}
+
+/// The Digitakt's control code of a key, by name.
+fn dt_code(name: &str) -> u8 {
+    (1..48).find(|&c| panel::key_name(c) == Some(name)).unwrap_or_else(|| panic!("no key {name}"))
+}
+
+/// The Digitakt, after the manual's panel drawing. Its keys are the upstream
+/// control codes (`panel::WIRE`), not `device_keys`.
+fn layout_digitakt() -> Vec<Place> {
+    let k = |name: &str, px: i32, py: i32, w: i32, h: i32| Place { c: Control::Key(dt_code(name)), x: dx(px) - w / 2, y: dy(py) - h / 2, w, h };
+    let mut v = Vec::new();
+    for (n, py) in [("FUNC", 655), ("TRK", 714), ("PTN", 824), ("BANK", 908)] {
+        v.push(k(n, 356, py, 80, 50));
+    }
+    for (n, px) in [("SONG", 448), ("GLOBAL", 508), ("SAMPLE", 568), ("TEMPO", 627)] {
+        v.push(k(n, px, 655, 50, 50));
+    }
+    for (n, px) in [("RECORD", 460), ("PLAY", 538), ("STOP", 616)] {
+        v.push(k(n, px, 714, 80, 50));
+    }
+    for (n, px) in [("TRIG", 735), ("SRC", 805), ("FLTR", 876), ("AMP", 947), ("LFO", 1018)] {
+        v.push(k(n, px, 615, 52, 50));
+    }
+    v.push(k("YES", 735, 684, 52, 50));
+    v.push(k("NO", 735, 744, 52, 50));
+    v.push(k("UP", 854, 684, 52, 50));
+    for (n, px) in [("LEFT", 795), ("DOWN", 854), ("RIGHT", 913)] {
+        v.push(k(n, px, 744, 52, 50));
+    }
+    v.push(k("PAGE", 1007, 744, 80, 50));
+    for i in 0..16 {
+        v.push(k(&(i + 1).to_string(), 460 + (i % 8) * 78, if i < 8 { 825 } else { 908 }, 80, 76));
+    }
+    // LEVEL/DATA has no push: the manual presses only the DATA ENTRY knobs, and on
+    // OS 1.53 the wire's group 2 bit 4 does nothing; FUNC + turn is the Sound Browser.
+    let kn = |enc: u8, push: Option<u8>, px: i32, py: i32| Place { c: Control::Knob(enc, push), x: dx(px) - 30, y: dy(py) - 30, w: 60, h: 74 };
+    v.push(kn(8, None, 347, 534));
+    for i in 0..8u8 {
+        let n = ((b'A' + i) as char).to_string();
+        v.push(kn(i, Some(dt_code(&n)), [737, 830, 923, 1016][(i % 4) as usize], if i < 4 { 441 } else { 533 }));
+    }
+    v
 }
 
 /// Photo coordinates of the Syntakt panel (a front-on photo) to the window.
@@ -570,6 +639,9 @@ fn face_label(dev: Dev, name: &str) -> String {
         };
         return s.to_string();
     }
+    if dev == Dev::Digitakt {
+        return name.to_string();
+    }
     let s = match name {
         "SAMPLER" => "SMPLNG",
         "PLAYMODE" => "PLAY",
@@ -712,6 +784,31 @@ fn sub_label(dev: Dev, name: &str) -> &'static str {
             "BANK" => "MUTE MODE",
             _ => "",
         },
+        Dev::Digitakt => match name {
+            "SONG" => "IMP/EXP",
+            "GLOBAL" => "SAVE PROJ",
+            "SAMPLE" => "DIRECT",
+            "TEMPO" => "TAP TEMPO",
+            "TRK" => "CHROMATIC",
+            "RECORD" => "COPY",
+            "PLAY" => "CLEAR",
+            "STOP" => "PASTE",
+            "PTN" => "METRONOME",
+            "BANK" => "MUTE MODE",
+            "YES" => "SAVE PTN",
+            "NO" => "RELOAD PTN",
+            "TRIG" => "QUANTIZE",
+            "SRC" => "ASSIGN",
+            "FLTR" => "DELAY",
+            "AMP" => "REVERB",
+            "LFO" => "MASTER",
+            "UP" => "RTRG/OCT+",
+            "DOWN" => "RTRG/OCT-",
+            "LEFT" => "UTIME-",
+            "RIGHT" => "UTIME+",
+            "PAGE" => "FILL/SCALE",
+            _ => "",
+        },
         Dev::RytmMk1 => match name {
             "FX" => "KIT",
             "MUTE" => "SOUND",
@@ -756,7 +853,7 @@ fn knob_label(dev: Dev, enc: u8) -> &'static str {
     match (dev, enc) {
         (Dev::A4, A4_ENC_LEVEL) | (Dev::Rytm, 8) => "TRACK LEVEL|SOUND BROWSER",
         (Dev::A4Mk1, A4_ENC_LEVEL) | (Dev::RytmMk1, 8) => "LEVEL",
-        (Dev::Syntakt, 8) => "LEVEL/DATA",
+        (Dev::Syntakt, 8) | (Dev::Digitakt, 8) => "LEVEL/DATA",
         _ => ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"].get(enc as usize).copied().unwrap_or("?"),
     }
 }
@@ -854,6 +951,20 @@ fn draw_display(cv: &mut Canvas, dev: Dev, view: &View) {
                 }
             }
             cv.text(sx(372), sy(617) - 6, "SYNTAKT", 2, 0xF4F4F4);
+        }
+        Dev::Digitakt => {
+            // The screen's outline and the OLED.
+            let (bx0, by0, bw, bh) = (dx(405), dy(402), dx(679) - dx(405), dy(590) - dy(402));
+            cv.round_fill(bx0 + 2, by0 + 3, bw, bh, 4, 0x08090A);
+            cv.round_fill(bx0, by0, bw, bh, 4, 0x0A0C10);
+            cv.round_frame(bx0, by0, bw, bh, 4, 1, 0x4A4E54);
+            let (ox, oy) = (bx0 + (bw - 256) / 2, dy(432));
+            for y in 0..64usize {
+                for x in 0..128usize {
+                    let on = (view.oled[(7 - y / 8) + 8 * x] >> (y % 8)) & 1 != 0;
+                    cv.fill(ox + x as i32 * 2, oy + y as i32 * 2, 2, 2, if on { OLED_ON } else { OLED_OFF });
+                }
+            }
         }
         Dev::A4Mk1 | Dev::RytmMk1 => {
             // A black window; the backlit glass with a margin round the
@@ -997,6 +1108,26 @@ fn decor(cv: &mut Canvas, dev: Dev, th: &Theme) {
                 cv.fill(trig_x(last) + 23, y, 1, 5, th.label);
             }
         }
+        Dev::Digitakt => {
+            // The connectors along the top edge.
+            for (px, s) in [(382, "LEFT"), (436, "RIGHT"), (491, "INPUT L"), (546, "INPUT R"), (612, "MIDI IN"), (690, "MIDI OUT|SYNC A"), (764, "MIDI THRU|SYNC B"), (846, "USB"), (917, "DC IN"), (998, "POWER")] {
+                lines(cv, dx(px), dy(335), s, th.key_dim);
+            }
+            // Master Volume: an analog pot (with its mark), not a panel input.
+            draw_knob(cv, dev, th, dx(347), dy(441), 30, false, true);
+            cv.text_centered(dx(347), dy(441) + 37, "MASTER VOLUME", 1, th.label);
+            // The Level/Data push's second function, under its name.
+            cv.text_centered(dx(347), dy(534) + 30 + 17, "SOUND BROWSER", 1, th.sub);
+            // Quick Mute: the bracket right of the trig rows.
+            let x = dx(1050);
+            for (y0, y1) in [(dy(825), dy(848)), (dy(888), dy(908))] {
+                cv.fill(x + 16, y0.min(y1), 1, (y1 - y0).abs(), th.label);
+            }
+            for y in [dy(825), dy(908)] {
+                cv.fill(x, y, 16, 1, th.label);
+            }
+            lines(cv, dx(1061), dy(858), "QUICK|MUTE", th.sub);
+        }
         Dev::RytmMk1 => {
             cv.text(bx(880), by(160), "ANALOG RYTM", 2, 0xF0F0F0);
             draw_knob(cv, dev, th, bx(200), by(185), 24, false, true);
@@ -1064,6 +1195,10 @@ fn strips(dev: Dev) -> Vec<Strip> {
             (&panel::SYNTAKT_PAGE_LEDS, [1655, 1707, 1760, 1813].iter().map(|&px| (sx(px), sy(922))).collect(), &["1:4", "2:4", "3:4", "4:4"], true),
             (&[panel::SYNTAKT_TRK_LED], vec![(sx(205), sy(1057))], &[], false),
         ],
+        Dev::Digitakt => vec![
+            (&panel::PAGE_LEDS, [973, 995, 1018, 1040].iter().map(|&px| (dx(px), dy(700))).collect(), &["1:4", "2:4", "3:4", "4:4"], true),
+            (&[panel::DIGITAKT_TRK_LED], vec![(dx(356), dy(759))], &[], false),
+        ],
         Dev::RytmMk1 => vec![
             (&panel::RYTMMK1_PAGE_LEDS, (0..4).map(|i| (bx(1725) + i * 22, by(843))).collect(), &["1:4", "2:4", "3:4", "4:4"], false),
             (&[29], vec![(bx(1188), by(652))], &[], false),
@@ -1124,12 +1259,23 @@ fn icon(cv: &mut Canvas, name: &str, cx: i32, cy: i32, s: i32, c: u32) -> bool {
     true
 }
 
-/// The Syntakt's symbol keys: `...`, the gear, the metronome. -> drawn.
+/// The Syntakt's and Digitakt's symbol keys: `...`, the gear, the waveform, the
+/// metronome. -> drawn.
 fn syntakt_icon(cv: &mut Canvas, name: &str, cx: i32, cy: i32, c: u32) -> bool {
     match name {
         "MENU" => {
             for k in -1..=1 {
                 cv.fill(cx + 7 * k - 2, cy - 2, 5, 4, c);
+            }
+        }
+        "SONG" => {
+            for k in -1..=1 {
+                cv.fill(cx + 7 * k - 2, cy - 2, 5, 4, c);
+            }
+        }
+        "SAMPLE" => {
+            for (k, h) in [(-3, 3), (-2, 6), (-1, 9), (0, 4), (1, 8), (2, 5), (3, 2)] {
+                cv.fill(cx + 3 * k, cy - h, 1, 2 * h, c);
             }
         }
         "GLOBAL" => {
@@ -1158,8 +1304,9 @@ fn syntakt_icon(cv: &mut Canvas, name: &str, cx: i32, cy: i32, c: u32) -> bool {
 /// An MKII key (dark rounded key, trig key, pad or piano key).
 #[allow(clippy::too_many_arguments)]
 fn draw_key_mk2(cv: &mut Canvas, dev: Dev, th: &Theme, view: &View, p: &Place, name: &str, down: bool, latched: bool) {
-    let lit = panel::led_for_key(panel::rytm_code(name)).and_then(|l| led(view, l));
-    let has_led = panel::led_for_key(panel::rytm_code(name)).is_some();
+    let code = if let Control::Key(c) = p.c { c } else { 0 };
+    let lit = panel::led_for_key(code).and_then(|l| led(view, l));
+    let has_led = panel::led_for_key(code).is_some();
     let (x, y, w, h) = (p.x, p.y, p.w, p.h);
     let cx = x + w / 2;
     if let Some(n) = pad_number(name).filter(|_| dev == Dev::Rytm) {
@@ -1210,15 +1357,21 @@ fn draw_key_mk2(cv: &mut Canvas, dev: Dev, th: &Theme, view: &View, p: &Place, n
         }
         return;
     }
-    let trig = trig_number(name);
+    // The Digitakt's trigs go by number (`panel::key_name`).
+    let trig = if dev == Dev::Digitakt { name.parse().ok() } else { trig_number(name) };
     let big = trig.is_some() || matches!(name, "RECORD" | "PLAY" | "STOP");
     let r = if big { 6 } else { 5 };
     let mut face = match (dev, name) {
         (Dev::Syntakt, "FUNC") => 0xC8464B,
+        (Dev::Digitakt, _) => th.key,
         (Dev::A4, "FUNC") => 0x3B4A3D,
         (_, "FUNC") => 0x2B5A6E,
         _ => th.key,
     };
+    // The Digitakt's keys are backlit.
+    if let Some(c) = lit.filter(|_| dev == Dev::Digitakt) {
+        face = mix(face, rgb(c), level(c) * 150 / 255);
+    }
     if down {
         face = mix(face, 0xFFFFFF, 60);
     }
@@ -1236,8 +1389,11 @@ fn draw_key_mk2(cv: &mut Canvas, dev: Dev, th: &Theme, view: &View, p: &Place, n
         cv.round_frame(x - 4, y - 4, w + 8, h + 8, r + 4, 1, YELLOW);
     }
     let ink = match lit {
+        // On a backlit Digitakt key the symbol stays pale.
+        Some(c) if dev == Dev::Digitakt => mix(bright(c), 0xFFFFFF, 200),
         Some(c) => mix(th.key_dim, bright(c), (level(c) * 256 / 180).min(256)),
         None if dev == Dev::Syntakt && name == "FUNC" => 0xF2D0D0,
+        None if dev == Dev::Digitakt && name == "FUNC" => th.sub,
         None if has_led => th.key_dim,
         None => th.key_text,
     };
@@ -1246,8 +1402,12 @@ fn draw_key_mk2(cv: &mut Canvas, dev: Dev, th: &Theme, view: &View, p: &Place, n
         let s = n.to_string();
         cv.text_centered(cx, cy - 9, &s, 2, ink);
         cv.fill(cx - tw(&s, 2) / 2, cy + 8, tw(&s, 2), 2, ink);
+        // The Digitakt frames each bar's first step.
+        if dev == Dev::Digitakt && (n - 1) % 4 == 0 {
+            cv.round_frame(cx - 23, cy - 21, 46, 42, 3, 1, ink);
+        }
     } else {
-        let drawn = (dev == Dev::Syntakt && syntakt_icon(cv, name, cx, cy, ink)) || icon(cv, name, cx, cy, if big { 9 } else { 7 }, ink);
+        let drawn = (matches!(dev, Dev::Syntakt | Dev::Digitakt) && syntakt_icon(cv, name, cx, cy, ink)) || icon(cv, name, cx, cy, if big { 9 } else { 7 }, ink);
         if !drawn {
             let s = face_label(dev, name);
             cv.text_centered(cx, cy - 3, &s, 1, ink);
@@ -1256,6 +1416,7 @@ fn draw_key_mk2(cv: &mut Canvas, dev: Dev, th: &Theme, view: &View, p: &Place, n
     // Under the key.
     let under = match trig {
         Some(_) if dev == Dev::Syntakt => "",
+        Some(n) if dev == Dev::Digitakt => ["KICK", "SNARE", "TOM", "CLAP", "COWBELL", "CLOSED HAT", "OPEN HAT", "CYMBAL", "MIDI A", "MIDI B", "MIDI C", "MIDI D", "MIDI E", "MIDI F", "MIDI G", "MIDI H"][n as usize - 1],
         Some(n) if dev == Dev::A4 => ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"][n as usize - 1],
         Some(n) => ["BD", "SD", "RS", "CP", "BT", "LT", "MT", "HT", "CH", "OH", "CY", "CB", "", "", "", ""][n as usize - 1],
         None => sub_label(dev, name),
