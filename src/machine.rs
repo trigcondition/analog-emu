@@ -1238,7 +1238,7 @@ impl Machine {
         for _ in 0..n {
             h.microframe(&mut self.cpu.bus, &mut self.ob_in);
         }
-        let midi: Vec<u8> = h.midi_out.drain(..).collect();
+        let midi: Vec<u8> = std::mem::take(&mut h.midi_out);
         if let Some(n) = h.ack {
             let mut a = vec![0u8; n.max(2)];
             a[0] = 0xF0;
@@ -1486,7 +1486,7 @@ impl Machine {
         }
         let side = core.bus.io.dsp_side.as_mut().unwrap();
         std::mem::swap(&mut link.mbox, &mut side.mbox);
-        let edges: Vec<u64> = side.irq_edges.drain(..).collect();
+        let edges: Vec<u64> = std::mem::take(&mut side.irq_edges);
         for t in edges {
             link.raise(t, 0);
         }

@@ -785,7 +785,7 @@ impl UsbHost {
         }
         let reads = match self.midi_every {
             0 => 8,
-            n if self.uf % n == 0 => 1,
+            n if self.uf.is_multiple_of(n) => 1,
             _ => 0,
         };
         for _ in 0..reads {
@@ -794,7 +794,7 @@ impl UsbHost {
                 break;
             }
             self.stats.midi_dtds += 1;
-            for p in b.chunks_exact(4) {
+            for p in b.as_chunks::<4>().0 {
                 // CIN -> bytes in the packet (USB MIDI 1.0, table 4-1).
                 let n = match p[0] & 0x0F {
                     0x5 | 0xF => 1,
