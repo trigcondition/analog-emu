@@ -605,7 +605,10 @@ other absolute references below 0x1000 in code [inferred from objdump]. So
 stock reads and writes address 0 legitimately - whatever answers there on
 hardware (FlexBus?) is not known. Stock 1.73 and rytm-mods lp3n both cold-boot
 and run every scenario clean under `DTEMU_STRICT=1`; under `=log` the two
-builds' sets of (pc, page, read/write) are identical (rytm-mods review, item 4).
+builds' sets of (pc, page, read/write) are identical (rytm-mods review, item 4). The page-0
+list is per build (`Profile::strict_page0_pcs`): OS 1.74's is the same fifteen
+instructions, found in that image at +0x6c (the first twelve) and +0x1cc (the
+last three) [measured]; stock 1.74 cold-boots clean under `DTEMU_STRICT=1`.
 
 **The real USB MIDI sender** (`dtboot --usb-midi-real`, `DTEMU_USB_MIDI_REAL=1`;
 needs `--usb-host`): the sender (0x400029e0), short sender (0x40002934) and

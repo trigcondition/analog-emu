@@ -193,6 +193,7 @@ impl Machine {
         let strict = !strict_env.is_empty() && strict_env != "0";
         bus.set_strict(strict);
         bus.strict_raise = strict_env != "log";
+        bus.strict_page0_pcs = prof.strict_page0_pcs;
         let mut cpu = Cpu::new(bus);
         // The block compiler, on its own thread (DTEMU_JIT_SYNC=1: in line;
         // DTEMU_NO_JIT=1: the interpreter alone).
