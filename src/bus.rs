@@ -42,17 +42,6 @@ const STRICT_ALLOWED: &[(u32, u32)] = &[
     (0xFC0C_8000, 0xFC0C_9000), // SSI1's page, 0x4000561c (setup)
 ];
 
-/// Strict mode: the stock instructions that read or write page 0 (address
-/// 0..0xFFF), allowed from these PCs only, so that a NULL access anywhere else
-/// still faults. Measured in stock runs: 0x4012119a (`clr.w (a0)`, a0 = 0,
-/// half a million times a run), 0x4012185c (`move.b 0x0,d1`), 0x400afe1e
-/// (`tst.b 0x8`). The others are the stock image's remaining absolute
-/// references below 0x1000 in code (objdump of stock 1.73, inferred).
-const STRICT_PAGE0_PCS: &[u32] = &[
-    0x4012_119A, 0x4012_185C, 0x400A_FE1E, 0x4009_8AD2, 0x4009_8AEE, 0x400A_FFD6, 0x4010_53F0, 0x4010_56F0,
-    0x4010_5D2E, 0x4010_B07A, 0x4010_CCBC, 0x4012_19D8, 0x4013_B882, 0x4015_4322, 0x4015_43A8,
-];
-
 pub struct Bus {
     pub ddr: Vec<u8>,
     ddr_mask: u32,
@@ -76,6 +65,9 @@ pub struct Bus {
     pub strict_pending: Option<(u32, u32)>,
     /// Every strict violation, (pc, page, write) -> (first address, count).
     pub strict_log: BTreeMap<(u32, u32, bool), (u32, u64)>,
+    /// Strict mode: the PCs allowed to touch page 0, per build (the profile's
+    /// `strict_page0_pcs`; stock 1.73's until `Machine::new` sets it).
+    pub strict_page0_pcs: &'static [u32],
     pub io: Io,
     /// The Rytm's analog voices, modelled from the control frame (`analog.rs`).
     /// None on the Digitakt. Not part of a snapshot: envelopes restart silent.
@@ -162,6 +154,7 @@ impl Bus {
             sram_span: 0x0C00_0000,
             strict_pending: None,
             strict_log: BTreeMap::new(),
+            strict_page0_pcs: crate::symbols::AR_173_PAGE0_PCS,
             io: Io::new(),
             analog: None,
             analog_sent: None,
@@ -376,7 +369,7 @@ impl Bus {
         let base = addr & !(SPARSE_PAGE - 1);
         if self.strict
             && !STRICT_ALLOWED.iter().any(|&(lo, hi)| (lo..hi).contains(&base))
-            && !(base == 0 && STRICT_PAGE0_PCS.contains(&self.pc))
+            && !(base == 0 && self.strict_page0_pcs.contains(&self.pc))
             && !(self.nor.is_some() && base.wrapping_sub(crate::nor::PRAM_BASE) < crate::nor::PRAM_SIZE)
         {
             self.strict_hit(addr, write);
@@ -1015,6 +1008,14 @@ mod tests {
         b.write16(0, 0);
         assert_eq!(b.strict_pending, None);
         assert_eq!(b.strict_log.len(), 2);
+        // 1.74's list: the same store, moved; 1.73's PC is no longer allowed.
+        b.strict_page0_pcs = crate::symbols::AR_174_PAGE0_PCS;
+        b.pc = 0x4012_1206;
+        b.write16(0, 0);
+        assert_eq!(b.strict_pending, None);
+        b.pc = 0x4012_119A;
+        b.write16(0, 0);
+        assert_eq!(b.strict_pending, Some((0x4012_119A, 0)));
         // Off: the mirror and unmapped pages are plain memory again.
         let mut b = Bus::new(16);
         b.write32(0x8001_0000, 7);

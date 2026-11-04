@@ -19,6 +19,27 @@ pub const ARMK1_174_SHA256: &str = "6d021e22e8912cfc1ee84e619c35db0174455cbc42bf
 pub const ST_142_SHA256: &str = "1a9723b19fb54d0566c1f690379d2e6dfe43227f77e170ad731dd029430eb3e7";
 pub const MAIN_LOAD: u32 = 0x4000_0400;
 
+/// Strict mode: the stock instructions that read or write page 0 (address
+/// 0..0xFFF), allowed from these PCs only, so that a NULL access anywhere else
+/// still faults (bus.rs). Measured in stock runs: 0x4012119a (`clr.w (a0)`,
+/// a0 = 0, half a million times a run), 0x4012185c (`move.b 0x0,d1`),
+/// 0x400afe1e (`tst.b 0x8`). The others are the stock image's remaining
+/// absolute references below 0x1000 in code (objdump of stock 1.73, inferred).
+/// The other profiles use this list too, as before (not checked in their images).
+pub const AR_173_PAGE0_PCS: &[u32] = &[
+    0x4012_119A, 0x4012_185C, 0x400A_FE1E, 0x4009_8AD2, 0x4009_8AEE, 0x400A_FFD6, 0x4010_53F0, 0x4010_56F0,
+    0x4010_5D2E, 0x4010_B07A, 0x4010_CCBC, 0x4012_19D8, 0x4013_B882, 0x4015_4322, 0x4015_43A8,
+];
+
+/// `AR_173_PAGE0_PCS` in stock OS 1.74, in the same order: each 1.73
+/// instruction's first 8 bytes found once in the 1.74 image, at +0x6c for the
+/// first twelve and +0x1cc for the last three [measured]. A stock 1.74 boot
+/// under DTEMU_STRICT=log hits 0x40121206 and 0x401218c8 only [measured].
+pub const AR_174_PAGE0_PCS: &[u32] = &[
+    0x4012_1206, 0x4012_18C8, 0x400A_FE8A, 0x4009_8B3E, 0x4009_8B5A, 0x400B_0042, 0x4010_545C, 0x4010_575C,
+    0x4010_5D9A, 0x4010_B0E6, 0x4010_CD28, 0x4012_1A44, 0x4013_BA4E, 0x4015_44EE, 0x4015_4574,
+];
+
 /// Which unit an OS image is for: it selects the board around the CPU (memory
 /// size, flash, panel, voices), not just addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +185,8 @@ pub struct Profile {
     pub boot_blob: (u32, u32),
     pub boot_ver: u32,
     pub boot_ver_flash: u32,
+    /// Strict mode: the PCs allowed to touch page 0 (`AR_173_PAGE0_PCS`).
+    pub strict_page0_pcs: &'static [u32],
     /// Every `bra.b *` in the image: the RTOS idle points.
     pub idle_spins: Vec<u32>,
 }
@@ -352,6 +375,7 @@ impl Profile {
             boot_blob: (0, 0),
             boot_ver: 0,
             boot_ver_flash: 0,
+            strict_page0_pcs: AR_173_PAGE0_PCS,
             idle_spins,
         }
     }
@@ -462,6 +486,7 @@ impl Profile {
             boot_blob: (0, 0),
             boot_ver: 0,
             boot_ver_flash: 0,
+            strict_page0_pcs: AR_173_PAGE0_PCS,
             idle_spins,
         }
     }
@@ -533,6 +558,7 @@ impl Profile {
             boot_blob: (0, 0),
             boot_ver: 0,
             boot_ver_flash: 0,
+            strict_page0_pcs: AR_174_PAGE0_PCS,
             idle_spins,
         }
     }
@@ -604,6 +630,7 @@ impl Profile {
             boot_blob: (0, 0),
             boot_ver: 0,
             boot_ver_flash: 0,
+            strict_page0_pcs: AR_173_PAGE0_PCS,
             idle_spins,
         }
     }
@@ -681,6 +708,7 @@ impl Profile {
             boot_blob: (0x4022_6EF0, 0x4023_3FC0),
             boot_ver: 0x4022_6EE8,
             boot_ver_flash: 0xFFF8,
+            strict_page0_pcs: AR_173_PAGE0_PCS,
             idle_spins,
         }
     }
@@ -754,6 +782,7 @@ impl Profile {
             boot_blob: (0x4028_C770, 0x402A_1B84),
             boot_ver: 0x4028_C768,
             boot_ver_flash: 0x1_FFF8,
+            strict_page0_pcs: AR_173_PAGE0_PCS,
             idle_spins,
         }
     }
@@ -826,6 +855,7 @@ impl Profile {
             boot_blob: (0, 0),
             boot_ver: 0,
             boot_ver_flash: 0,
+            strict_page0_pcs: AR_173_PAGE0_PCS,
             idle_spins,
         }
     }
