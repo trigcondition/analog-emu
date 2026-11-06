@@ -291,6 +291,18 @@ pub struct Io {
     /// happens next (a boot from the flash) is the tools' business.
     #[serde(skip)]
     pub reset_request: bool,
+    /// The Analog Four MKII's CONTROL IN 1 and 2 (EXP/CV IN 1, 2): what each
+    /// input sees (`CvIn`), read by the OS as the ColdFire ADC's channels 8
+    /// and 9 (ADRSLT8/9, 0xFC09_4012/14; `0x4011806c`). None: nothing
+    /// plugged in, the registers read back as memory. Set by `--cv-in` or
+    /// `DTEMU_CV_IN` (`Io::cv_in_from`).
+    #[serde(skip)]
+    pub cv_in: [Option<CvIn>; 2],
+    /// The A4's CV OUT A..D as the OS last sent them: voice frame words 56..59
+    /// (`0x80003ddc + 2c`) [measured: CV A as VALUE LIN 0..5 V, VAL 0, 64, 127
+    /// gave word 56 = 0, 0x13ff, 0x27af; 57..59 stayed 0], kept by bus.rs.
+    #[serde(skip)]
+    pub cv_out: [u16; 4],
     /// Registers that read as a fixed value (status bits nothing else sets).
     pub forced: HashMap<u32, u32>,
     /// Ignore IMR masking, as the reference emulator effectively did.
@@ -388,6 +400,8 @@ impl Io {
             supercap_flat: false,
             epfr: 0,
             reset_request: false,
+            cv_in: Io::cv_in_from(std::env::var("DTEMU_CV_IN").ok().as_deref()),
+            cv_out: [0; 4],
             forced,
             ignore_masks: false,
             trace_intc: std::env::var_os("DTEMU_TRACE_INTC").is_some(),
@@ -1127,6 +1141,11 @@ impl Io {
             let m = if size == 4 { u32::MAX } else { (1u32 << (8 * size)) - 1 };
             return Some((v >> sh) & m);
         }
+        if (a == 0xFC09_4012 || a == 0xFC09_4014) && size == 2 {
+            if let Some(v) = self.adc_result(((a - 0xFC09_4012) / 2) as usize) {
+                return Some(v);
+            }
+        }
         match a & 0xFFFF_C000 {
             0xFC04_8000 => return self.intc_read(0, a & 0x3FFF, size),
             0xFC04_C000 => return self.intc_read(1, a & 0x3FFF, size),
@@ -1510,5 +1529,72 @@ impl Io {
         }
         self.update_irq();
         self.deadline = if next.is_finite() { next.ceil().max(now + 1.0) as u64 } else { u64::MAX };
+    }
+}
+
+
+/// What a CONTROL IN of the Analog Four MKII sees (`Io::cv_in`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CvIn {
+    /// A fixed voltage, in millivolts (a CV source or a pedal held still).
+    Volts(i32),
+    /// One of the A4's own CV outputs (0..3: A..D) patched into it with a cable.
+    Out(usize),
+}
+
+/// The CV outputs' and inputs' scales. Out: the OS's own word for a voltage
+/// with the emulator's calibration record (gains 0x40000000, offsets 0;
+/// machine.rs) [measured: VALUE LIN 0..5 V at VAL 127 sends 0x27af, at 64
+/// 0x13ff], so 10159 a word is 5000 mV (a unit's DAC and its calibration are
+/// not modelled). The input side follows
+/// the OS's own uncalibrated ADC conversion (`0x401182b0`: ADC units = 16295 +
+/// mV x 32000 / 15676, the image's defaults at `0x40219fd4`/`0x40219fdc`), so
+/// a voltage reads back as the same millivolts through the OS's CV ZERO and
+/// MAX LEVEL settings; the result register holds those 15-bit units with the
+/// low 3 bits clear (a 12-bit result, left-justified).
+pub const CV_OUT_WORD_5V: i32 = 10_159;
+pub const ADC_ZERO: i32 = 16_295;
+pub const ADC_GAIN: i32 = 15_676;
+
+impl Io {
+    /// `--cv-in` / `DTEMU_CV_IN`: comma-separated `PORT=SOURCE`, PORT 1 or 2,
+    /// SOURCE `A`..`D` (that CV output, looped) or millivolts (`2500`, `-1200mV`).
+    /// Anything else is ignored with a message.
+    pub fn cv_in_from(spec: Option<&str>) -> [Option<CvIn>; 2] {
+        let mut out = [None, None];
+        for part in spec.unwrap_or("").split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let parsed = part.split_once('=').and_then(|(p, s)| {
+                let port = match p.trim() { "1" => 0, "2" => 1, _ => return None };
+                let s = s.trim();
+                let src = match s.to_ascii_uppercase().as_str() {
+                    "A" => CvIn::Out(0),
+                    "B" => CvIn::Out(1),
+                    "C" => CvIn::Out(2),
+                    "D" => CvIn::Out(3),
+                    v => CvIn::Volts(v.trim_end_matches("MV").trim().parse().ok()?),
+                };
+                Some((port, src))
+            });
+            match parsed {
+                Some((port, src)) => out[port] = Some(src),
+                None => eprintln!("cv-in: '{part}' ignored (PORT=SOURCE: 1 or 2 = A..D or millivolts)"),
+            }
+        }
+        out
+    }
+
+    /// CV OUT n's voltage, in millivolts.
+    pub fn cv_out_mv(&self, n: usize) -> i32 {
+        self.cv_out[n] as i16 as i32 * 5_000 / CV_OUT_WORD_5V
+    }
+
+    /// ADRSLT8/9 for CONTROL IN `port` (0, 1), or None when nothing is plugged in.
+    fn adc_result(&self, port: usize) -> Option<u32> {
+        let mv = match self.cv_in.get(port).copied().flatten()? {
+            CvIn::Volts(mv) => mv,
+            CvIn::Out(n) => self.cv_out_mv(n),
+        };
+        let units = (ADC_ZERO as i64 + mv as i64 * 32_000 / ADC_GAIN as i64).clamp(0, 0x7FF8) as u32;
+        Some(units & !7)
     }
 }

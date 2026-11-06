@@ -107,6 +107,9 @@ struct Opts {
     usb_midi_tcp: Option<String>,
     /// --din-midi-tcp ADDR: the DIN MIDI port the same way (miditcp), in at the line's rate.
     din_midi_tcp: Option<String>,
+    /// --cv-in SPEC: the Analog Four MKII's CONTROL IN 1/2 (dtemu::io::CvIn):
+    /// `1=A` loops CV OUT A into it, `2=2500` holds it at 2.5 V; DTEMU_CV_IN too.
+    cv_in: Option<String>,
     /// --power-off: closing the window switches the Rytm off (Machine::power_off):
     /// the firmware saves its working state to the card, which is written
     /// back; no snapshot is saved, so the next start is a cold boot from it.
@@ -141,6 +144,7 @@ fn parse() -> Opts {
         usb_host: false,
         usb_midi_tcp: None,
         din_midi_tcp: None,
+        cv_in: None,
         power_off: false,
         stdin_commands: false,
     };
@@ -157,6 +161,7 @@ fn parse() -> Opts {
             "--usb-host" => o.usb_host = true,
             "--usb-midi-tcp" => o.usb_midi_tcp = it.next().cloned(),
             "--din-midi-tcp" => o.din_midi_tcp = it.next().cloned(),
+            "--cv-in" => o.cv_in = it.next().cloned(),
             "--ob-link" => {
                 let next = it.clone().next().filter(|a| !a.starts_with("--")).cloned();
                 if next.is_some() {
@@ -210,6 +215,7 @@ fn parse() -> Opts {
                      \x20       {pad}[--usb-midi-tcp ADDR]  (the USB MIDI port as a raw MIDI byte stream over TCP, e.g. 7321 = 127.0.0.1:7321;\n\
                      \x20       {pad}                        headless too; one client at a time, the newest; a LAN address warns)\n\
                      \x20       {pad}[--din-midi-tcp ADDR]  (the DIN MIDI port the same way, e.g. 7322 = 127.0.0.1:7322)\n\
+                     \x20       {pad}[--cv-in SPEC]  (A4 MKII CONTROL IN 1/2: 1=A loops CV OUT A in, 2=2500 holds 2.5 V)\n\
                      \x20       {pad}[--flash FILE]  (the SPI flash, kept in FILE: an OS upgrade over USB MIDI persists;\n\
                      \x20       {pad}                 with no FIRMWARE named, the OS in it boots)\n\n\
                      Defaults: FIRMWARE {fw}, --card {card}.\n\
@@ -260,6 +266,9 @@ fn emulate(
     let ips = o.ips;
     m.cpu.bus.io.ips = ips;
     m.cpu.bus.io.usb_audio_capture = o.usb_wav.is_some();
+    if o.cv_in.is_some() {
+        m.cpu.bus.io.cv_in = dtemu::io::Io::cv_in_from(o.cv_in.as_deref());
+    }
     let ports = o.midi && (!o.headless || o.midi_headless);
     // DTEMU_MIDI_NAME renames the ports (default "rytm-emu", "a4-emu" on an A4,
     // "syntakt-emu" on a Syntakt),
@@ -360,6 +369,9 @@ fn emulate(
             }
             m.cpu.bus.io.ips = ips;
             m.cpu.bus.io.usb_audio_capture = o.usb_wav.is_some();
+            if o.cv_in.is_some() {
+                m.cpu.bus.io.cv_in = dtemu::io::Io::cv_in_from(o.cv_in.as_deref());
+            }
             t0 = Instant::now();
             emu0 = m.now();
             last_speed = (Instant::now(), m.now());

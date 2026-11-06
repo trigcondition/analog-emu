@@ -509,7 +509,7 @@ Code reading in OS 1.56 [measured unless tagged]:
 - **CV** (`0x400fc9a2`, when +0x10 != 0), CV out c = 0..3: offset = +0x14 + 4c,
   gains = +0x24 + 4c and +0x34 + 4c, each minus a trim from `0x4045c888 + 6c`
   (zero at boot) -> `0x41864a64/54/44 + 4c`. Uncalibrated all three are 0. The CV
-  outputs are voice frame words 60..63 (`0x80003de4 + 2c`) = offset +
+  outputs are voice frame words 56..59 (`0x80003ddc + 2c`; section 15) = offset +
   (gain x value) >> 8 (EMAC, clamped; `0x400fc8e6..0x400fc972`).
 - **KBD** (when u16 +0x24c != 0, format 2): six 256-entry u16 tables at +0x24e
   (format-1 default: 0, 10 .. 2550) and four u16 at +0xe4e (default 150), which
@@ -651,3 +651,29 @@ OS 1.56 (the only A4 MKII OS file to hand, so the upgrade reinstalls 1.56):
   code; not tried on an A4].
 - **The window**: `a4` opens `a4-emu in` / `a4-emu out` / `a4-emu usb in` /
   `a4-emu usb out`; on Windows create those in loopMIDI.
+
+## 15. CV outputs and CONTROL IN (2026-11-06)
+
+**CV OUT A..D [measured]** are voice frame words 56..59 (`0x80003ddc + 2c`), not
+60..63 as section 11 had it: CV A set to VALUE LIN 0.00..5.00 V, its VAL at 0, 64
+and 127 sent word 56 = 0, 0x13ff and 0x27af; words 57..59 stayed 0. With the
+emulator's calibration record (gains 0x40000000, offsets 0) a word is
+5000 mV / 10159. How a unit's calibrated words map to its DAC's volts is not
+modelled; the emulator keeps the four words (`Io::cv_out`).
+
+**CONTROL IN 1 and 2 [traced, measured]** (EXP/CV IN 1, 2) are the ColdFire
+ADC's channels 8 and 9: `0x4011806c` reads ADRSLT8/9 (`0xFC09_4012/14`), filters
+them into `0x4186f474 + 4p` (`>> 19` is the 12-bit reading), and per its port
+setting (`0x8000609c + 0x28p`: mode 0 OFF, 1 CV, 2 EXPR; levels from
+`0x40100352`, which converts CV ZERO and MAX LEVEL in mV to ADC units with
+`0x401182b0`: units = off + mV x 32000 / gain, uncalibrated off 16295 and gain
+15676 at `0x40219fd4`/`0x40219fdc`) writes the input's value to `0x80005b04 + 2p`
+(CV: 0x4000 at 0 V, bipolar). The emulator answers the two registers when an
+input is plugged in (`--cv-in` / `DTEMU_CV_IN`: `1=A` patches CV OUT A into
+CONTROL IN 1, `2=2500` holds CONTROL IN 2 at 2.5 V), with the units the OS's own
+conversion expects for that voltage, so CV ZERO 0 and MAX 5000 read 0 V as no
+modulation and 5 V as full. Unplugged, the registers read back as memory, as
+before. Checked: CV A VALUE LIN 0..5 V looped into CONTROL IN 1 (CV, 0..5000),
+CONTROL IN 1 MOD at full depth on a parameter: VAL 0, 64, 127 gave 0x3ff4,
+0x6033, 0x7ff3 at `0x80005b04` and the parameter's value moved from its base to
+half and to the top.
