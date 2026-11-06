@@ -102,6 +102,11 @@ struct Opts {
     /// Teensy) over TCP (dtemu::oblink).
     ob_link: Option<String>,
     usb_host: bool,
+    /// --usb-midi-real: the firmware's own USB MIDI sender (Machine::set_usb_midi_real) with the
+    /// simulated USB host reading it (implies --usb-host), kept across an OS upgrade's reboot.
+    /// Without it the emulator takes the sender's calls, and a mod that checks the sender's
+    /// state first (0x413db254 = 1, endpoint 1 enabled; core-ar2's core_midi_try_send) sends nothing.
+    usb_midi_real: bool,
     /// --usb-midi-tcp ADDR: the USB MIDI port as a raw MIDI byte stream over TCP (miditcp), for
     /// tools on a host without virtual MIDI ports (Windows), and one address per emulator.
     usb_midi_tcp: Option<String>,
@@ -139,6 +144,7 @@ fn parse() -> Opts {
         usb_wav: None,
         ob_link: None,
         usb_host: false,
+        usb_midi_real: false,
         usb_midi_tcp: None,
         din_midi_tcp: None,
         power_off: false,
@@ -155,6 +161,10 @@ fn parse() -> Opts {
             "--midi-from" => o.midi_from = it.next().cloned(),
             "--usb-wav" => o.usb_wav = it.next().map(PathBuf::from),
             "--usb-host" => o.usb_host = true,
+            "--usb-midi-real" => {
+                o.usb_host = true;
+                o.usb_midi_real = true;
+            }
             "--usb-midi-tcp" => o.usb_midi_tcp = it.next().cloned(),
             "--din-midi-tcp" => o.din_midi_tcp = it.next().cloned(),
             "--ob-link" => {
@@ -205,6 +215,7 @@ fn parse() -> Opts {
                      \x20       {pad}[--latency MS] [--audio-null] [--wav OUT.wav] [--no-midi]\n\
                      \x20       {pad}[--audio-in audio|ext|both]  (the Mac's default input into AUDIO IN / EXT IN)\n\
                      \x20       {pad}[--midi-from NAME] [--usb-host]  (an existing MIDI source, e.g. a real Rytm, into the DIN input)\n\
+                     \x20       {pad}[--usb-midi-real]  (the firmware's own USB MIDI sender, read by the simulated USB host; implies --usb-host)\n\
                      \x20       {pad}[--usb-wav FILE]  (record the USB audio stream: MAIN, 8 voices, AUDIO IN; 12 ch)\n\
                      \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301; 0.0.0.0:7301 for a host on the LAN)\n\
                      \x20       {pad}[--usb-midi-tcp ADDR]  (the USB MIDI port as a raw MIDI byte stream over TCP, e.g. 7321 = 127.0.0.1:7321;\n\
@@ -244,6 +255,18 @@ fn view_of(m: &Machine, status: String) -> View {
 }
 
 /// The machines whose USB MIDI port has virtual ports: the Digitakt's needs --usb-host to carry anything.
+/// The simulated USB host (--usb-host) and the firmware's own MIDI sender (--usb-midi-real), at
+/// start and again on the machine an OS upgrade's reboot makes (Machine::reboot_from_flash builds a
+/// new one, without either).
+fn attach_usb(m: &mut Machine, o: &Opts) {
+    if o.usb_host && m.usb_host.is_none() {
+        m.usb_host = Some(dtemu::usbhost::UsbHost::new());
+    }
+    if o.usb_midi_real && !m.usb_midi_real {
+        m.set_usb_midi_real(true);
+    }
+}
+
 fn usb_ports(m: &Machine) -> bool {
     m.is_rytm() || m.is_a4() || m.prof.device == dtemu::symbols::Device::Digitakt
 }
@@ -352,7 +375,10 @@ fn emulate(
             // The end of an OS upgrade: boot what is in the flash now.
             save_flash(&mut m, o);
             match m.reboot_from_flash() {
-                Ok(name) => eprintln!("reset: booting {name} from the flash"),
+                Ok(name) => {
+                    eprintln!("reset: booting {name} from the flash");
+                    attach_usb(&mut m, o);
+                }
                 Err(e) => {
                     eprintln!("reset: {e}");
                     m.cpu.bus.io.reset_request = false;
@@ -697,8 +723,9 @@ pub fn main() {
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     if o.usb_host {
-        m.usb_host = Some(dtemu::usbhost::UsbHost::new());
-        eprintln!("usb: a simulated host is attached (set USB CONFIG to OVERBRIDGE)");
+        attach_usb(&mut m, &o);
+        eprintln!("usb: a simulated host is attached (set USB CONFIG to OVERBRIDGE){}",
+                  if o.usb_midi_real { "; the firmware's own USB MIDI sender runs" } else { "" });
     }
     if let Some(addr) = &o.ob_link {
         match dtemu::oblink::ObLink::listen(addr) {
