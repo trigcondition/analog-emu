@@ -117,6 +117,13 @@ with `dtboot --midi 9d0064@5G` or a SysEx file with `--midi-file dump.syx@5G`.
 ports too: the emulator hands it to the OS as USB input and returns the replies
 (docs/RYTM-PORT.md, DIN MIDI). `tools/ekproto.py` encodes and decodes it for tests.
 
+By default the window takes the OS's USB MIDI sender calls itself, and the sender's own state
+stays as with no host: port not configured (0x413db254 = 0 on the Rytm MKII 1.73/1.74),
+endpoint 1 off. Code that checks that state before it sends, such as a mod's own SysEx replies,
+then sends nothing. `--usb-midi-real` (window, implies `--usb-host`; dtboot's `--usb-host
+--usb-midi-real`) runs the OS's own sender instead, read by the simulated USB host, and keeps
+both across an OS upgrade's reboot. Its output reaches `rytm-emu usb out` and `--usb-midi-tcp` as before.
+
 **OS upgrades** (MKII units): the SPI flash is writable (`src/spiflash.rs`), so an OS
 upgrade sent by Transfer, elektroid or elkflash runs as on a unit: the transfer, the
 UPGRADE OS NOW? prompt, ERASING FLASH..., the write and the reset. With `--flash
