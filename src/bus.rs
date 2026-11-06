@@ -880,6 +880,12 @@ impl Bus {
                 // return L/R, mixed with the analog dry path.
                 let o = (a4.frame_addr as usize) & (SRAM_SIZE - 1);
                 let out = a4.frame(&self.sram[o..o + crate::a4voice::FRAME_LEN]);
+                // CV OUT A..D: frame words 56..59 (Io::cv_out; a CONTROL IN
+                // patched to one reads it, Io::cv_in).
+                for (n, w) in self.io.cv_out.iter_mut().enumerate() {
+                    let i = 2 * (56 + n);
+                    *w = u16::from_be_bytes([self.sram[o + i], self.sram[o + i + 1]]);
+                }
                 let ext = self.io.ssi.ext_in.pop_front().unwrap_or((0.0, 0.0));
                 let w = |x: f32| (x.clamp(-1.0, 1.0) * crate::a4voice::RX_SCALE) as i32;
                 let s = out.send;
