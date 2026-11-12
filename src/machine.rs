@@ -184,6 +184,13 @@ impl Machine {
         // DTEMU_CACHE=1 (or =log): the I- and D-cache model (cache.rs). It
         // runs on the interpreter alone, without predecoded blocks.
         bus.cache = crate::cache::Caches::from_env().map(Box::new);
+        // DTEMU_TIMING=unit: the clock counts core cycles (timing.rs). Its
+        // memory costs come from the cache model, so that is turned on too.
+        if let Some(t) = crate::timing::Timing::from_env()? {
+            bus.io.ips = t.p.hz;
+            bus.io.esdhc.timing = Some(crate::esdhc::CardTiming::from_env()?);
+            bus.timing = Some(Box::new(t));
+        }
         let cached = bus.cache.is_some();
         if std::env::var_os("DTEMU_NO_ICACHE").is_none() && !cached {
             bus.icache_enable(os.data.len() as u32);
@@ -197,7 +204,10 @@ impl Machine {
         let mut cpu = Cpu::new(bus);
         // The block compiler, on its own thread (DTEMU_JIT_SYNC=1: in line;
         // DTEMU_NO_JIT=1: the interpreter alone).
-        if std::env::var_os("DTEMU_NO_JIT").is_none() && !strict && !cached {
+        // Unit timing charges every instruction and access, which compiled
+        // blocks skip: it runs on the interpreter (predecoded blocks).
+        let timed = cpu.bus.timing.is_some();
+        if std::env::var_os("DTEMU_NO_JIT").is_none() && !strict && !cached && !timed {
             if std::env::var_os("DTEMU_JIT_SYNC").is_some() {
                 cpu.jit = Some(Box::new(crate::jit::Jit::new(cpu.bus.icache_flushes)));
             } else {

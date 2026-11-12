@@ -107,6 +107,11 @@ struct Opts {
     usb_midi_tcp: Option<String>,
     /// --din-midi-tcp ADDR: the DIN MIDI port the same way (miditcp), in at the line's rate.
     din_midi_tcp: Option<String>,
+    /// --usb-overbridge [SECS]: at SECS of emulated time (default 9) set GLOBAL > SYSTEM > USB CONFIG
+    /// to OVERBRIDGE in the firmware's state as its menu does (Rytm OS 1.74 only) and have the simulated host
+    /// leave for 0.2 s and enumerate again, as a host does after the menu's switch: from then on it
+    /// runs the Overbridge stream both ways, as the Sidecar Pi in usb=mirror does. Implies --usb-host.
+    usb_overbridge: Option<f64>,
     /// --power-off: closing the window switches the Rytm off (Machine::power_off):
     /// the firmware saves its working state to the card, which is written
     /// back; no snapshot is saved, so the next start is a cold boot from it.
@@ -141,6 +146,7 @@ fn parse() -> Opts {
         usb_host: false,
         usb_midi_tcp: None,
         din_midi_tcp: None,
+        usb_overbridge: None,
         power_off: false,
         stdin_commands: false,
     };
@@ -157,6 +163,14 @@ fn parse() -> Opts {
             "--usb-host" => o.usb_host = true,
             "--usb-midi-tcp" => o.usb_midi_tcp = it.next().cloned(),
             "--din-midi-tcp" => o.din_midi_tcp = it.next().cloned(),
+            "--usb-overbridge" => {
+                let next = it.clone().next().filter(|a| !a.starts_with("--")).cloned();
+                if next.is_some() {
+                    it.next();
+                }
+                o.usb_host = true;
+                o.usb_overbridge = Some(next.map_or(9.0, |v| v.parse().expect("--usb-overbridge SECS")));
+            }
             "--ob-link" => {
                 let next = it.clone().next().filter(|a| !a.starts_with("--")).cloned();
                 if next.is_some() {
@@ -205,6 +219,7 @@ fn parse() -> Opts {
                      \x20       {pad}[--latency MS] [--audio-null] [--wav OUT.wav] [--no-midi]\n\
                      \x20       {pad}[--audio-in audio|ext|both]  (the Mac's default input into AUDIO IN / EXT IN)\n\
                      \x20       {pad}[--midi-from NAME] [--usb-host]  (an existing MIDI source, e.g. a real Rytm, into the DIN input)\n\
+                     \x20       {pad}[--usb-overbridge [SECS]]  (USB CONFIG = OVERBRIDGE at SECS (9), then the host enumerates again and streams; implies --usb-host)\n\
                      \x20       {pad}[--usb-wav FILE]  (record the USB audio stream: MAIN, 8 voices, AUDIO IN; 12 ch)\n\
                      \x20       {pad}[--ob-link [ADDR]]  (Overbridge input from a host over TCP, default 127.0.0.1:7301; 0.0.0.0:7301 for a host on the LAN)\n\
                      \x20       {pad}[--usb-midi-tcp ADDR]  (the USB MIDI port as a raw MIDI byte stream over TCP, e.g. 7321 = 127.0.0.1:7321;\n\
@@ -247,6 +262,14 @@ fn view_of(m: &Machine, status: String) -> View {
 fn usb_ports(m: &Machine) -> bool {
     m.is_rytm() || m.is_a4() || m.prof.device == dtemu::symbols::Device::Digitakt
 }
+/// GLOBAL > SYSTEM > USB CONFIG in OS 1.74's RAM (1 = OVERBRIDGE) [measured, docs/RYTM-PORT.md].
+const USB_CONFIG: u32 = 0x405c_8e4c;
+/// OS 1.74's current USB mode (0x40004e68) and its descriptor table pointer, mode x 0x28 + USB_TABLES.
+const USB_MODE: u32 = 0x413d_b2d4;
+const USB_TABLE: u32 = 0x413d_b2d0;
+const USB_TABLES: u32 = 0x4027_28d8;
+/// The mode the menu's OVERBRIDGE item sets (0x4006c3be).
+const USB_MODE_OVERBRIDGE: u32 = 6;
 
 /// The emulator loop. Runs until `quit`.
 fn emulate(
@@ -257,7 +280,12 @@ fn emulate(
     audio: Arc<Audio>,
     quit: Arc<AtomicBool>,
 ) -> Machine {
-    let ips = o.ips;
+    // Unit timing (DTEMU_TIMING) sets the clock to the core's cycle rate;
+    // --ips is for the default instruction clock only.
+    let ips = match &m.cpu.bus.timing {
+        Some(t) => t.p.hz,
+        None => o.ips,
+    };
     m.cpu.bus.io.ips = ips;
     m.cpu.bus.io.usb_audio_capture = o.usb_wav.is_some();
     let ports = o.midi && (!o.headless || o.midi_headless);
@@ -276,7 +304,45 @@ fn emulate(
     let mut link_report = Instant::now();
     let mut speed = 0.0;
     let mut phase = 0.0f64;
+    // --usb-overbridge: the cycle at which USB CONFIG becomes OVERBRIDGE (from this start).
+    // Armed again at the reboot that ends an OS upgrade: the new OS boots in its saved mode.
+    let arm = |m: &Machine| o.usb_overbridge.filter(|_| m.is_rytm()).map(|s| m.now() + (s * ips) as u64);
+    let mut ob_at = arm(&m);
+    if o.usb_overbridge.is_some() && ob_at.is_none() {
+        eprintln!("usb overbridge: only on the Rytm (its USB CONFIG addresses are known); ignored");
+    }
+    let mut usb_report = Instant::now();
     while !quit.load(Ordering::Relaxed) {
+        if let Some(at) = ob_at.filter(|&at| m.now() >= at) {
+            // What the menu's OVERBRIDGE item does (OS 1.74, 0x4006c3be): the setting (0x400fa68a),
+            // then 0x40004e68(6): the USB mode (6 = OVERBRIDGE; USB MIDI boots as 3) and its descriptor
+            // table (mode x 0x28 + 0x402728d8), and a restart of the controller, which the host's
+            // departure and return stand in for.
+            // Until the OS has set its USB mode up (a slow boot), it is tried again each slice, for up to 30 s.
+            let now = m.now();
+            let bus = &mut m.cpu.bus;
+            let (mode, table) = (bus.peek32(USB_MODE), bus.peek32(USB_TABLE));
+            if mode < 8 && table == USB_TABLES + 0x28 * mode {
+                ob_at = None;
+                bus.poke8(USB_CONFIG, 1);
+                bus.poke32(USB_MODE, USB_MODE_OVERBRIDGE);
+                bus.poke32(USB_TABLE, USB_TABLES + 0x28 * USB_MODE_OVERBRIDGE);
+                let h = m.usb_host.get_or_insert_with(dtemu::usbhost::UsbHost::new);
+                h.gone.push((now, now + (0.2 * ips) as u64));
+                eprintln!("usb overbridge: USB CONFIG = OVERBRIDGE at {:.2} s; the host re-enumerates", now as f64 / ips);
+            } else if now >= at + (30.0 * ips) as u64 {
+                ob_at = None;
+                eprintln!("usb overbridge: not OS 1.74's USB mode layout (mode {mode:#x}, table {table:#x}); left as it is");
+            }
+        }
+        if o.usb_overbridge.is_some() && usb_report.elapsed() >= Duration::from_secs(10) {
+            usb_report = Instant::now();
+            if let Some(h) = m.usb_host.as_ref() {
+                eprintln!("usb host: {} enumerations, {} restarts, {} IN / {} OUT transfers, {} IN frames, USB CONFIG {}",
+                          h.stats.enumerations, h.stats.restarts, h.stats.in_transfers, h.stats.out_transfers,
+                          h.stats.in_frames, m.cpu.bus.peek8(USB_CONFIG));
+            }
+        }
         if let Some(dest) = o.audio_in.as_deref() {
             // Host input into the codec's input queues; at most 100 ms queued,
             // so a slow emulation drops input rather than lagging behind it.
@@ -352,7 +418,10 @@ fn emulate(
             // The end of an OS upgrade: boot what is in the flash now.
             save_flash(&mut m, o);
             match m.reboot_from_flash() {
-                Ok(name) => eprintln!("reset: booting {name} from the flash"),
+                Ok(name) => {
+                    eprintln!("reset: booting {name} from the flash");
+                    ob_at = arm(&m);
+                }
                 Err(e) => {
                     eprintln!("reset: {e}");
                     m.cpu.bus.io.reset_request = false;

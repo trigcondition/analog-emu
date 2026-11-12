@@ -285,6 +285,9 @@ pub struct Io {
     /// plain memory.
     #[serde(skip)]
     pub epfr: u8,
+    /// EPORT EPIER (0xFC090003), mirrored from the bus's writes.
+    #[serde(skip)]
+    pub epier: u8,
     /// The firmware wrote RCR's SOFTRST (0x80 to the byte at 0xEC090000), as
     /// the OS upgrade does once the flash is written (Rytm MKII OS 1.74
     /// `0x4009f53a`). `Machine::run_until` stops with `Stop::Reset`; what
@@ -387,6 +390,7 @@ impl Io {
             power_lost: false,
             supercap_flat: false,
             epfr: 0,
+            epier: 0,
             reset_request: false,
             forced,
             ignore_masks: false,
@@ -441,6 +445,10 @@ impl Io {
         self.set_line((2, 17), self.usb_irq);
         // EPORT IRQ1..7 are INTC0 sources 1..7.
         self.set_line((0, 2), self.epfr & 0x04 != 0);
+        // IRQ3: the eMMC's DAT0 (unit timing). Gated by EPIER, since the
+        // flag rises after every busy and the firmware enables it only while
+        // it waits for one.
+        self.set_line((0, 3), self.epfr & 0x08 != 0 && self.epier & 0x08 != 0);
         // IRQ4: the Syntakt's DSP (syntakt.rs); nothing else raises it here.
         self.set_line((0, 4), self.epfr & 0x10 != 0);
         // eDMA: channels 0-15 on INTC0 sources 8-23, 16-55 on INTC1 sources
@@ -1169,6 +1177,7 @@ impl Io {
                 return None;
             }
             0xFC0C_C000 => {
+                (self.esdhc.now, self.esdhc.ips) = (self.now, self.ips);
                 let r = self.esdhc.read(a & 0x3FFF, size);
                 if r.is_some() {
                     // A DATPORT read may complete the transfer.
@@ -1277,7 +1286,15 @@ impl Io {
                 }
             }
             0xFC0C_C000 => {
+                (self.esdhc.now, self.esdhc.ips) = (self.now, self.ips);
                 let r = self.esdhc.write(a & 0x3FFF, size, v);
+                if let Some(t) = self.esdhc.ready_at {
+                    // Unit timing: the card's busy ends then.
+                    self.lower_deadline(t as f64);
+                }
+                if std::mem::take(&mut self.esdhc.dat0_rose) {
+                    self.epfr |= 0x08; // a busy the firmware cut short
+                }
                 // Issuing a data command asks channel 59 for service.
                 if self.edma.erq & (1 << crate::esdhc::DMA_CHAN) != 0 && self.esdhc.dma_request() {
                     self.edma.kick |= 1 << crate::esdhc::DMA_CHAN;
@@ -1501,6 +1518,17 @@ impl Io {
             if let Some(t) = d.irq_at {
                 next = next.min(t as f64);
             }
+        }
+        // The eMMC's busy (unit timing): the data lands or DAT0 comes back.
+        if self.esdhc.service(self.now) && self.edma.erq & (1 << crate::esdhc::DMA_CHAN) != 0 && self.esdhc.dma_request() {
+            self.edma.kick |= 1 << crate::esdhc::DMA_CHAN;
+        }
+        if std::mem::take(&mut self.esdhc.dat0_rose) {
+            // DAT0 is EPORT IRQ3's pin: its edge sets the flag.
+            self.epfr |= 0x08;
+        }
+        if let Some(t) = self.esdhc.ready_at {
+            next = next.min(t as f64);
         }
         for ch in 0..64 {
             let b = self.edma.busy_until[ch];

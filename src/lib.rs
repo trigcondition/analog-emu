@@ -3,6 +3,7 @@
 pub mod firmware;
 pub mod bus;
 pub mod cache;
+pub mod timing;
 pub mod cpu;
 pub mod io;
 pub mod edma;

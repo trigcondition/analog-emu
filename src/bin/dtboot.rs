@@ -124,6 +124,9 @@ Environment:
                        (DTEMU_STRICT=log: listed only, no fault)
   DTEMU_PROFILE_DUMP=FILE  with --profile-after: every sampled block start and its
                        sample count (one sample per 64 instructions) to FILE
+  DTEMU_TIMING=unit    count core cycles from the MCF54418 timing tables and cache misses,
+                       so CPU load follows the unit's (interpreter only; docs/TIMING.md);
+                       DTEMU_TIMING_PARAMS=k=v,... sets its costs; clocks are then cycles
   DTEMU_CACHE=1        model the I- and D-caches (interpreter only; docs/CACHE.md);
                        =log also prints each stale instruction fetch
 ";
@@ -497,6 +500,7 @@ fn main() {
     let t0 = Instant::now();
     let (mut clock0, mut idle0) = (m.now(), m.stats.idle_skipped);
     let mut logged = 0;
+    let mut busy_prev = (m.now(), m.stats.idle_skipped);
     let mut target = m.now();
     while target < instr {
         // This chunk's events: [start, target) by their own clocks, whatever clock the CPU overshot to.
@@ -680,8 +684,13 @@ fn main() {
         top.sort_by_key(|b| std::cmp::Reverse(b.1));
         let irqs: Vec<String> = top.iter().take(8).map(|(v, n)| format!("v{v}:{n}")).collect();
         let lit = m.frame.as_ref().map(|f| Machine::lit(f)).unwrap_or(0);
+        // busy: the share of this report's clock not skipped in idle spins,
+        // the load analoghealth reads as CPU % (a chunk with its idle spins).
+        let (dn, di) = (m.now().saturating_sub(busy_prev.0), m.stats.idle_skipped.saturating_sub(busy_prev.1));
+        let busy = if dn > 0 { 100.0 * (1.0 - di as f64 / dn as f64) } else { 0.0 };
+        busy_prev = (m.now(), m.stats.idle_skipped);
         println!(
-            "{:>6.0}M pc={:08x} sr={:04x} idle={} frames={} lit={} tasks={} mainloop={} irq[{}] {:.1}s {}",
+            "{:>6.0}M busy={busy:.1}% pc={:08x} sr={:04x} idle={} frames={} lit={} tasks={} mainloop={} irq[{}] {:.1}s {}",
             m.now() as f64 / 1e6,
             m.cpu.pc,
             m.cpu.sr,
@@ -915,6 +924,9 @@ fn main() {
     }
     if let Some(c) = &m.cpu.bus.cache {
         print!("{}", c.report());
+    }
+    if let Some(t) = &m.cpu.bus.timing {
+        println!("{}", t.summary(m.now()));
     }
     print!("{}", m.task_report());
     let vt: Vec<String> = [97u32, 99, 154, 155, 180, 191, 192, 205, 207, 208, 223].iter().map(|v| format!("v{v}={:08x}", m.cpu.bus.peek32(m.cpu.vbr + v * 4))).collect();

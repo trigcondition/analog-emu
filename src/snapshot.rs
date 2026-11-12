@@ -249,6 +249,13 @@ pub fn load(m: &mut Machine, path: &Path) -> Result<(), String> {
         }
     }
     c.bus.io.esdhc.card.path = card_path;
+    // Host-side too: unit timing is the running machine's; a busy in flight
+    // was not saved, so it ends now.
+    if c.bus.timing.is_some() {
+        c.bus.io.esdhc.timing = crate::esdhc::CardTiming::from_env().ok();
+    }
+    c.bus.io.epier = c.bus.peek8(0xFC09_0003);
+    c.bus.io.esdhc.settle_after_restore();
     c.bus.io.deadline = c.bus.io.now;
     s.cpu.restore(c);
     // Snapshots carry memory only: the caches start empty (cache.rs).
