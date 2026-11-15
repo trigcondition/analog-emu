@@ -53,6 +53,16 @@ const STRICT_PAGE0_PCS: &[u32] = &[
     0x4010_5D2E, 0x4010_B07A, 0x4010_CCBC, 0x4012_19D8, 0x4013_B882, 0x4015_4322, 0x4015_43A8,
 ];
 
+/// The same instructions in the Rytm MKII OS 1.74 (`STRICT_PAGE0_PCS` through
+/// rytm-mods' 1.74 address map, re/os/1.74.toml; each one at a code address the
+/// map translates). Without them a 1.74 run under strict mode takes an access
+/// error at 0x40121206 (`clr.w (a0)`, 1.73's 0x4012119a) at once and keeps
+/// taking them: the OS no longer serves USB or the pages.
+pub const STRICT_PAGE0_PCS_RYTM_174: &[u32] = &[
+    0x4012_1206, 0x4012_18C8, 0x400A_FE8A, 0x4009_8B3E, 0x4009_8B5A, 0x400B_0042, 0x4010_545C, 0x4010_575C,
+    0x4010_5D9A, 0x4010_B0E6, 0x4010_CD28, 0x4012_1A44, 0x4013_BA4E, 0x4015_44EE, 0x4015_4574,
+];
+
 pub struct Bus {
     pub ddr: Vec<u8>,
     ddr_mask: u32,
@@ -66,6 +76,9 @@ pub struct Bus {
     /// before (reads from the backing page or mirror); the CPU then takes
     /// vector 2 with the faulting instruction's PC (`Cpu::strict_fault`).
     pub strict: bool,
+    /// The stock PCs allowed to touch page 0 in strict mode: the image's
+    /// profile's (`STRICT_PAGE0_PCS` unless the machine sets another).
+    pub strict_page0_pcs: &'static [u32],
     /// Strict mode raises the access error (`DTEMU_STRICT=1`), or only logs
     /// (`DTEMU_STRICT=log`).
     pub strict_raise: bool,
@@ -158,6 +171,7 @@ impl Bus {
             sparse: HashMap::new(),
             unmapped_touch: BTreeMap::new(),
             strict: false,
+            strict_page0_pcs: STRICT_PAGE0_PCS,
             strict_raise: true,
             sram_span: 0x0C00_0000,
             strict_pending: None,
@@ -376,7 +390,7 @@ impl Bus {
         let base = addr & !(SPARSE_PAGE - 1);
         if self.strict
             && !STRICT_ALLOWED.iter().any(|&(lo, hi)| (lo..hi).contains(&base))
-            && !(base == 0 && STRICT_PAGE0_PCS.contains(&self.pc))
+            && !(base == 0 && self.strict_page0_pcs.contains(&self.pc))
             && !(self.nor.is_some() && base.wrapping_sub(crate::nor::PRAM_BASE) < crate::nor::PRAM_SIZE)
         {
             self.strict_hit(addr, write);
