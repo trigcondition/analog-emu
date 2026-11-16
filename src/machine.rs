@@ -193,6 +193,9 @@ impl Machine {
         let strict_env = std::env::var("DTEMU_STRICT").unwrap_or_default();
         let strict = !strict_env.is_empty() && strict_env != "0";
         bus.set_strict(strict);
+        if prof.name.starts_with("Analog Rytm MKII OS 1.74") {
+            bus.strict_page0_pcs = crate::bus::STRICT_PAGE0_PCS_RYTM_174;
+        }
         bus.strict_raise = strict_env != "log";
         let mut cpu = Cpu::new(bus);
         // The block compiler, on its own thread (DTEMU_JIT_SYNC=1: in line;
