@@ -26,6 +26,9 @@
 
 use std::collections::VecDeque;
 
+/// A posted control request's outcome with `fs_iso`: (clock done, setup, data in, or why it failed).
+pub type CtlResult = (u64, [u8; 8], Result<Vec<u8>, String>);
+
 use crate::bus::Bus;
 
 const R: u32 = 0xFC0B_0000;
@@ -285,6 +288,29 @@ pub struct UsbHost {
     pub cdc_to_device: VecDeque<u8>,
     pub cdc_from_device: Vec<u8>,
     pub stats: UsbStats,
+    /// a full-speed host for the Rytm MKI's isochronous Overbridge stream (`--usb-fs`).
+    /// The port comes up at full speed; a SOF, with FRINDEX stepping by 8, once a millisecond; after the
+    /// configuration descriptor only SET_CONFIGURATION 1, then the requests of `ctl_at` at their clocks; endpoint
+    /// 0x83 IN read once a frame, each packet kept in `iso_in`. Off, everything runs as before.
+    pub fs_iso: bool,
+    /// Control requests to post at a clock: (clock, setup packet, host -> device data).
+    pub ctl_at: Vec<(u64, [u8; 8], Vec<u8>)>,
+    /// The data stages of posted host -> device requests, in queue order.
+    out_data: VecDeque<Vec<u8>>,
+    /// What each request came to with `fs_iso`: (clock done, setup, data in, or why it failed).
+    pub ctl_results: Vec<CtlResult>,
+    /// 0x83 IN packets with `fs_iso`: (clock, frame number, bytes).
+    pub iso_in: Vec<(u64, u32, Vec<u8>)>,
+    /// IN dTDs longer than the endpoint's queue head allows in one frame (Mult x max packet length).
+    pub iso_oversize: u64,
+    /// 32-bit writes to make at a clock, before that microframe's work (`--usb-poke`, a test hook).
+    pub pokes_at: Vec<(u64, u32, u32)>,
+    /// Clock ranges in which the host reads no isochronous IN packet (`--usb-iso-pause`); SOFs go on.
+    pub iso_pause: Vec<(u64, u64)>,
+    /// With a sink the packets go to it as they come (records as DTBOOT_USB_ISO's) instead of `iso_in`: a long
+    /// run keeps no packets in memory. `iso_sizes` counts every packet by size either way.
+    pub iso_sink: Option<std::io::BufWriter<std::fs::File>>,
+    pub iso_sizes: std::collections::BTreeMap<usize, u64>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -350,6 +376,16 @@ impl UsbHost {
             cdc_to_device: VecDeque::new(),
             cdc_from_device: Vec::new(),
             stats: UsbStats::default(),
+            fs_iso: false,
+            ctl_at: Vec::new(),
+            out_data: VecDeque::new(),
+            ctl_results: Vec::new(),
+            iso_in: Vec::new(),
+            iso_oversize: 0,
+            pokes_at: Vec::new(),
+            iso_pause: Vec::new(),
+            iso_sink: None,
+            iso_sizes: std::collections::BTreeMap::new(),
         }
     }
 
@@ -469,7 +505,8 @@ impl UsbHost {
             Phase::Reset => {
                 if now > self.t + 10 * ms && bus.peek32(USBSTS) & STS_URI == 0 {
                     // Reset done: connected, enabled, high speed.
-                    let p = (bus.peek32(PORTSC1) & !(1 << 8) & !(3 << 26)) | 1 | (1 << 2) | (2 << 26);
+                    let speed = if self.fs_iso { 0 } else { 2 << 26 };
+                    let p = (bus.peek32(PORTSC1) & !(1 << 8) & !(3 << 26)) | 1 | (1 << 2) | speed;
                     bus.poke32(PORTSC1, p);
                     raise(bus, STS_PCI);
                     self.phase = Phase::Enumerate;
@@ -487,6 +524,33 @@ impl UsbHost {
             }
             Phase::Enumerate | Phase::Stream => {
                 if !running {
+                    return;
+                }
+                if self.fs_iso {
+                    // Full speed: requests due now, then a SOF once a millisecond (FRINDEX's frame number in
+                    // bits 13:3, bits 2:0 zero) and that frame's isochronous IN packet; control every microframe.
+                    let t = bus.io.now;
+                    while let Some(k) = self.pokes_at.iter().position(|e| e.0 <= t) {
+                        let (_, a, v) = self.pokes_at.remove(k);
+                        bus.poke32(a, v);
+                        self.say(&format!("poke {a:08x} = {v:08x}"));
+                    }
+                    while let Some(k) = self.ctl_at.iter().position(|e| e.0 <= t) {
+                        let (_, s, d) = self.ctl_at.remove(k);
+                        if s[0] & 0x80 == 0 && u16::from_le_bytes([s[6], s[7]]) > 0 {
+                            self.out_data.push_back(d);
+                        }
+                        self.queue.push_back(s);
+                    }
+                    if self.uf.is_multiple_of(8) {
+                        let fr = (bus.peek32(FRINDEX) + 8) & 0x3FF8;
+                        bus.poke32(FRINDEX, fr);
+                        raise(bus, STS_SRI);
+                        if self.phase == Phase::Stream && !self.iso_pause.iter().any(|&(a, b)| t >= a && t < b) {
+                            self.iso(bus);
+                        }
+                    }
+                    self.control(bus, now);
                     return;
                 }
                 // Start of (micro)frame: FRINDEX counts microframes.
@@ -641,7 +705,12 @@ impl UsbHost {
             bus.poke32(EPSETUPSR, s);
             raise(bus, STS_UI);
             self.say(&format!("setup {:02x?}", setup));
-            self.ctl = Some(Ctl { setup, out: Vec::new(), stage: Stage::Data, got: Vec::new(), t0: now });
+            let out = if setup[0] & 0x80 == 0 && u16::from_le_bytes([setup[6], setup[7]]) > 0 {
+                self.out_data.pop_front().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            self.ctl = Some(Ctl { setup, out, stage: Stage::Data, got: Vec::new(), t0: now });
             return;
         }
         let mut c = self.ctl.take().unwrap();
@@ -650,6 +719,9 @@ impl UsbHost {
         if epcr0 & 0x0001_0001 != 0 {
             self.say(&format!("setup {:02x?}: stalled", c.setup));
             bus.poke32(R + 0x1C0, epcr0 & !0x0001_0001);
+            if self.fs_iso {
+                self.ctl_results.push((bus.io.now, c.setup, Err("stall".into())));
+            }
             return;
         }
         let dev_to_host = c.setup[0] & 0x80 != 0;
@@ -675,6 +747,9 @@ impl UsbHost {
                 if !matches!(c.stage, Stage::Status) {
                     if now > c.t0 + 16_000 {
                         self.say(&format!("setup {:02x?}: no data stage, dropped", c.setup));
+                        if self.fs_iso {
+                            self.ctl_results.push((bus.io.now, c.setup, Err("no data stage".into())));
+                        }
                         return;
                     }
                     self.ctl = Some(c);
@@ -692,10 +767,16 @@ impl UsbHost {
         if !done {
             if now > c.t0 + 16_000 {
                 self.say(&format!("setup {:02x?}: no status stage, dropped", c.setup));
+                if self.fs_iso {
+                    self.ctl_results.push((bus.io.now, c.setup, Err("no status stage".into())));
+                }
                 return;
             }
             self.ctl = Some(c);
             return;
+        }
+        if self.fs_iso {
+            self.ctl_results.push((bus.io.now, c.setup, Ok(c.got.clone())));
         }
         self.finished(&c);
     }
@@ -713,6 +794,10 @@ impl UsbHost {
                 self.queue.push_front([0x80, 6, 0, 2, 0, 0, t[0], t[1]]);
             } else {
                 self.config_desc = c.got.clone();
+                if self.fs_iso {
+                    self.queue.push_back([0x00, 9, 1, 0, 0, 0, 0, 0]); // SET_CONFIGURATION 1; the rest is scheduled
+                    return;
+                }
                 if self.device_stack {
                     let info = parse_config(&c.got);
                     if info.ob_out_packet > 32 {
@@ -895,6 +980,41 @@ impl UsbHost {
             }
         }
         self.stream_out(bus, to_rytm);
+    }
+
+    /// `fs_iso`: this frame's isochronous IN packet on 0x83, if the device has one primed. A dTD longer than
+    /// the queue head's Mult x max packet length could not leave in one frame: counted in `iso_oversize`.
+    fn iso(&mut self, bus: &mut Bus) {
+        if bus.peek32(EPSR) & (1 << 19) == 0 {
+            return;
+        }
+        let qh = Self::qh(bus, 3, true);
+        let cap = bus.peek32(qh);
+        let (maxp, mult) = (((cap >> 16) & 0x7FF) as usize, (cap >> 30) as usize);
+        let td = Self::next_dtd(bus, qh);
+        if td & 1 == 0 {
+            let tok = bus.peek32((td & !0x1F) + 4);
+            if tok & 0x80 != 0 && ((tok >> 16) & 0x7FFF) as usize > maxp * mult.max(1) {
+                self.iso_oversize += 1;
+            }
+        }
+        let (b, done) = self.run_dtds(bus, 3, true, &[]);
+        if done || !b.is_empty() {
+            self.stats.in_transfers += 1;
+            *self.iso_sizes.entry(b.len()).or_insert(0) += 1;
+            let (t, fr) = (bus.io.now, (bus.peek32(FRINDEX) >> 3) & 0x7FF);
+            if let Some(w) = self.iso_sink.as_mut() {
+                use std::io::Write;
+                let mut rec = Vec::with_capacity(14 + b.len());
+                rec.extend_from_slice(&t.to_le_bytes());
+                rec.extend_from_slice(&fr.to_le_bytes());
+                rec.extend_from_slice(&(b.len() as u16).to_le_bytes());
+                rec.extend_from_slice(&b);
+                w.write_all(&rec).expect("DTBOOT_USB_ISO");
+            } else {
+                self.iso_in.push((t, fr, b));
+            }
+        }
     }
 
     /// OUT: one transfer of whole blocks, when the Rytm has a buffer primed and

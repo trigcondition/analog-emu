@@ -277,6 +277,14 @@ impl Profile {
                     p.name = "Analog Rytm MKII OS 1.74 (modified)";
                     return Ok(p);
                 }
+                // A modified Rytm MKI OS 1.74 (an AE-analog-rytm-mods build): the caller says so after
+                // checking that no hooked address of this profile lies near a changed byte
+                // (every address constant of the MKI code within 16 bytes of a changed byte).
+                if std::env::var_os("DTEMU_RYTMMK1_174").is_some() {
+                    let mut p = Self::rytm_mk1_174(h, idle_spins);
+                    p.name = "Analog Rytm MKI OS 1.74 (modified)";
+                    return Ok(p);
+                }
                 let da4 = differ(A4_156_CODE);
                 if da4.is_empty() {
                     let mut p = Self::a4_156(h, idle_spins);

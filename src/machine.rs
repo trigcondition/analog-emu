@@ -106,6 +106,12 @@ pub struct Machine {
     /// stack pointer before the call, and the arguments pushed (2 for
     /// `queue_send`, then 1 for `sem_post`), popped when it is back.
     usb_call: Option<(u32, u32)>,
+    /// DTEMU_USB_FEED_PCS=PC[,PC..]: idle loops of a modified OS that replace the stock spin (e.g.
+    /// AE-analog-rytm-mods' 0011 CPU probe). The USB MIDI input is fed there as at an idle spin, nothing is skipped, and the
+    /// loop's scratch registers (d0 d1 a0 a1, which such a loop keeps live) are put back once the feed's calls are
+    /// done. Without it a build whose idle task never reaches a stock spin takes no USB MIDI at all.
+    usb_feed_pcs: Vec<u32>,
+    usb_feed_saved: Option<[u32; 4]>,
     /// The USB audio buffer the last receive-buffer copy wrote (read on the
     /// next call, when that copy is complete).
     usb_audio_last: Option<u32>,
@@ -235,6 +241,15 @@ impl Machine {
             heap_probe: None,
             pad_force: 100,
             usb_call: None,
+            usb_feed_pcs: std::env::var("DTEMU_USB_FEED_PCS")
+                .map(|v| {
+                    v.split(',')
+                        .filter(|x| !x.is_empty())
+                        .map(|x| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16).expect("DTEMU_USB_FEED_PCS: hex PCs"))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            usb_feed_saved: None,
             usb_audio_last: None,
             ob_in: std::collections::VecDeque::new(),
             ob_link: None,
@@ -684,6 +699,9 @@ impl Machine {
         for &a in &p.idle_spins {
             self.cpu.set_hook(a, true);
         }
+        for a in self.usb_feed_pcs.clone() {
+            self.cpu.set_hook(a, true);
+        }
     }
 
     /// Stand-in for the Rytm-side report of the EXT machine (rytm-mods 0021) to an
@@ -1052,6 +1070,20 @@ impl Machine {
             self.cpu.pc = ret;
             return false;
         }
+        if self.usb_feed_pcs.contains(&pc) {
+            let regs = [self.cpu.d[0], self.cpu.d[1], self.cpu.a[0], self.cpu.a[1]];
+            if self.feed_usb_midi(pc) {
+                self.usb_feed_saved.get_or_insert(regs);
+                return false;
+            }
+            if self.usb_call.is_none() {
+                if let Some(r) = self.usb_feed_saved.take() {
+                    (self.cpu.d[0], self.cpu.d[1], self.cpu.a[0], self.cpu.a[1]) = (r[0], r[1], r[2], r[3]);
+                }
+            }
+            return true;
+        }
+        let p = &self.prof;
         if p.idle_spins.contains(&pc) {
             self.stats.idle_hits += 1;
             if self.feed_usb_midi(pc) {

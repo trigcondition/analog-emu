@@ -209,6 +209,10 @@ pub struct Ssi0 {
 pub const SSI0_TX_CHAN: usize = 50;
 pub const SSI0_RX_CHAN: usize = 48;
 
+fn midi_out_cap_default() -> usize {
+    1 << 16
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Io {
     /// The USB controller's interrupt line (usbhost.rs keeps it current); not
@@ -261,6 +265,10 @@ pub struct Io {
     /// MIDI the firmware sent on UART9, until someone drains it.
     #[serde(skip)]
     pub midi_out: VecDeque<u8>,
+    /// How much of `midi_out` is kept (the last bytes): 64 KB, or all of a run with --midi-out
+    /// (a 30-minute soak's SysEx dumps are ~600 KB). Not in snapshots.
+    #[serde(skip, default = "midi_out_cap_default")]
+    pub midi_out_cap: usize,
     pub edma: Edma,
     pub esdhc: crate::esdhc::Esdhc,
     pub ssi: Ssi,
@@ -346,6 +354,7 @@ impl Io {
             usb_audio_capture: false,
             usb_audio: Vec::new(),
             midi_out: VecDeque::new(),
+            midi_out_cap: 1 << 16,
             edma: Edma {
                 cr: 0,
                 erq: 0,
@@ -835,7 +844,7 @@ impl Io {
                     u.tx.push(v);
                 }
                 if n == 9 {
-                    if self.midi_out.len() >= 1 << 16 {
+                    if self.midi_out.len() >= self.midi_out_cap {
                         self.midi_out.pop_front();
                     }
                     self.midi_out.push_back(v);

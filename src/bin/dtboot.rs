@@ -85,6 +85,19 @@ counts (suffixes k, M, G).
   --usb-host-gone FROM:TO  the host browns out and restarts: VBUS off, no bus
                        from FROM, then at TO a fresh host (bus reset, a new
                        enumeration); repeatable
+  --usb-fs             (implies --usb-host) a full-speed host for the
+                       Rytm MKI's isochronous stream: SOF once a millisecond, after the
+                       configuration only SET_CONFIGURATION 1, endpoint 0x83 IN read every
+                       frame; DTBOOT_USB_ISO=FILE keeps the packets (records of clock u64,
+                       frame u32, length u16, then the bytes, little endian)
+  --usb-ctl SETUP[:DATA]@AT  (with --usb-fs) a control request at clock AT: the 8-byte setup
+                       packet in hex (USB order), and for host -> device its data; each
+                       request's outcome is printed as a `usb ctl:` line at the end
+  --usb-poke ADDR=VALUE@AT  (with --usb-fs) write a 32-bit word (hex) at clock AT, a test hook
+  --usb-iso-pause FROM:TO  (with --usb-fs; repeatable) the host reads no isochronous IN packet from clock
+                       FROM to TO, SOFs go on (a host that stops polling, as at a re-enumeration on its hub)
+  --watch-write ADDR LEN  (repeatable) count the CPU's writes into DDR [ADDR, +LEN), by
+                       writing PC, printed as `watch-write:` at the end (JIT too; DMA is not seen)
   --ob-link [ADDR]     serve the Overbridge input to a host over TCP (oblink.rs;
                        default 127.0.0.1:7301; 0.0.0.0:PORT serves the LAN)
   --ext-in FILE.wav    play a 16-bit WAV into EXT IN L/R from the start (Rytm)
@@ -126,6 +139,8 @@ Environment:
                        sample count (one sample per 64 instructions) to FILE
   DTEMU_CACHE=1        model the I- and D-caches (interpreter only; docs/CACHE.md);
                        =log also prints each stale instruction fetch
+  DTEMU_USB_FEED_PCS=PC,..  a modified OS's own idle loop (in place of the stock spin) where
+                       the USB MIDI input is fed, with its scratch registers kept (no skipping)
 ";
 
 /// The flash holds no OS the emulator can boot: after an interrupted upgrade,
@@ -154,6 +169,11 @@ fn main() {
     let mut ob_in: Option<String> = None;
     let mut ob_link: Option<String> = None;
     let mut usb_host = false;
+    let mut usb_fs = false;
+    let mut usb_ctls: Vec<(u64, [u8; 8], Vec<u8>)> = Vec::new();
+    let mut usb_pokes: Vec<(u64, u32, u32)> = Vec::new();
+    let mut usb_pauses: Vec<(u64, u64)> = Vec::new();
+    let mut wwatches: Vec<(u32, u32)> = Vec::new();
     let mut usb_midi_real = false;
     let mut usb_sleep: Option<(u64, u64)> = None;
     let mut usb_noread: Option<(u64, u64)> = None;
@@ -177,6 +197,7 @@ fn main() {
     let mut card: Option<String> = None;
     let mut card_save = false;
     let mut flash: Option<String> = None;
+    let mut pram: Option<String> = None;
     let mut flash_loaded: Option<Vec<u8>> = None;
     let mut test_mode = false;
     let mut serials: Vec<(Vec<u8>, u64)> = Vec::new();
@@ -217,6 +238,37 @@ fn main() {
             "--ob-in" => ob_in = it.next().cloned(),
             "--ob-link" => ob_link = Some(it.next().cloned().unwrap_or_else(|| "127.0.0.1:7301".into())),
             "--usb-host" => usb_host = true,
+            "--usb-fs" => {
+                usb_host = true;
+                usb_fs = true;
+            }
+            "--watch-write" => {
+                // ADDR LEN (hex, then a count): CPU writes into DDR [ADDR, ADDR + LEN), counted by writing PC
+                let a = u32::from_str_radix(it.next().unwrap().trim_start_matches("0x"), 16).unwrap() & 0x07FF_FFFF;
+                let n = num(it.next().unwrap()) as u32;
+                wwatches.push((a, a + n));
+            }
+            "--usb-poke" => {
+                let v = it.next().expect("--usb-poke ADDR=VALUE@AT");
+                let (av, at) = v.split_once('@').expect("--usb-poke ADDR=VALUE@AT");
+                let (a, x) = av.split_once('=').expect("--usb-poke ADDR=VALUE@AT");
+                let h = |t: &str| u32::from_str_radix(t.trim_start_matches("0x"), 16).expect("--usb-poke hex");
+                usb_pokes.push((num(at), h(a), h(x)));
+            }
+            "--usb-iso-pause" => {
+                let v = it.next().expect("--usb-iso-pause FROM:TO");
+                let (a, b) = v.split_once(':').expect("--usb-iso-pause FROM:TO");
+                usb_pauses.push((num(a), num(b)));
+            }
+            "--usb-ctl" => {
+                // --usb-ctl SETUP[:DATA]@CLOCK, hex
+                let v = it.next().expect("--usb-ctl SETUP[:DATA]@AT");
+                let (what, at) = v.split_once('@').expect("--usb-ctl SETUP[:DATA]@AT");
+                let (st, dt) = what.split_once(':').unwrap_or((what, ""));
+                let hx = |x: &str| -> Vec<u8> { (0..x.len()).step_by(2).map(|i| u8::from_str_radix(&x[i..i + 2], 16).expect("--usb-ctl hex")).collect() };
+                let setup: [u8; 8] = hx(st).try_into().expect("--usb-ctl: the setup packet is 8 bytes");
+                usb_ctls.push((num(at), setup, hx(dt)));
+            }
             "--nudge" => {
                 // --nudge ENC:DIR[:F]@CLOCK[xCOUNT/SPACING]: one value step (F: with FUNC)
                 let v = it.next().unwrap();
@@ -289,6 +341,7 @@ fn main() {
             "--card" => card = it.next().cloned(),
             "--card-save" => card_save = true,
             "--flash" => flash = it.next().cloned(),
+            "--pram" => pram = it.next().cloned(),
             "--usb-serial" => {
                 // TEXT@CLOCK: a line to the serial device; a newline ends it.
                 let v = it.next().unwrap();
@@ -412,6 +465,9 @@ fn main() {
             m.cpu.bus.watch = Some((o, o + 4));
         }
     }
+    for &(lo, hi) in &wwatches {
+        m.cpu.bus.wwatch.push((lo, hi, 0, Default::default()));
+    }
     if let Some((a, n)) = watch_read {
         let o = a & 0x07FF_FFFF;
         m.cpu.bus.watch = Some((o, o + n));
@@ -437,9 +493,28 @@ fn main() {
         let fresh = m.attach_card(std::path::Path::new(p)).unwrap();
         println!("card {p}: {} sectors in use{}", m.cpu.bus.io.esdhc.card.sectors.len(), if fresh { " (new, sample area formatted)" } else { "" });
     }
+    // --pram FILE: the MKI's persistent CS1 memory (2 MB at 0x20000000) from
+    // FILE at the start and back to FILE at the end, so a cold boot on it is a power cycle.
+    if let Some(p) = &pram {
+        if let Ok(d) = std::fs::read(p) {
+            let mut pages = 0;
+            for (k, page) in d.chunks(0x1000).enumerate() {
+                if page.iter().any(|&b| b != 0) {
+                    let mut b = Box::new([0u8; 0x1000]);
+                    b[..page.len()].copy_from_slice(page);
+                    m.cpu.bus.sparse.insert(dtemu::nor::PRAM_BASE + (k as u32) * 0x1000, b);
+                    pages += 1;
+                }
+            }
+            println!("pram {p}: {pages} non-zero pages loaded");
+        } else {
+            println!("pram {p}: new");
+        }
+    }
     if let Some(p) = &load {
         dtemu::snapshot::load(&mut m, std::path::Path::new(p)).unwrap();
         println!("restored {p} at clock {}", m.now());
+        // (the snapshot's Io carries the default MIDI-out cap: raise it again below)
         // A snapshot carries its own flash (an older one does not, and leaves
         // the file's): say so when it replaced a different --flash file.
         if let (Some(before), Some(f)) = (&flash_loaded, m.cpu.bus.spi.as_ref()) {
@@ -448,6 +523,10 @@ fn main() {
             }
         }
         instr += m.now();
+    }
+    // with --midi-out keep all of the run's DIN output (after a snapshot's Io is in)
+    if midi_out_file.is_some() {
+        m.cpu.bus.io.midi_out_cap = 256 << 20;
     }
     // --ob-in FILE.wav[:CH]: a 16-bit WAV's first channel as Overbridge input
     // channel CH (default 4, BD), from the start, at 48 kHz.
@@ -471,6 +550,15 @@ fn main() {
         h.midi_every = usb_midi_every;
         h.gone = usb_gone.clone();
         h.cdc = !serials.is_empty();
+        h.fs_iso = usb_fs;
+        h.ctl_at = usb_ctls.clone();
+        h.pokes_at = usb_pokes.clone();
+        h.iso_pause = usb_pauses.clone();
+        if usb_fs {
+            if let Ok(f) = std::env::var("DTBOOT_USB_ISO") {
+                h.iso_sink = Some(std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&f).expect("DTBOOT_USB_ISO")));
+            }
+        }
         m.usb_host = Some(h);
     }
     if usb_midi_real {
@@ -808,6 +896,18 @@ fn main() {
         m.save_flash(std::path::Path::new(p)).expect("--flash");
         println!("flash written back to {p}");
     }
+    if let Some(p) = &pram {
+        let mut d = vec![0u8; dtemu::nor::PRAM_SIZE as usize];
+        let mut pages = 0;
+        for k in 0..(dtemu::nor::PRAM_SIZE / 0x1000) {
+            if let Some(b) = m.cpu.bus.sparse.get(&(dtemu::nor::PRAM_BASE + k * 0x1000)) {
+                d[(k * 0x1000) as usize..((k + 1) * 0x1000) as usize].copy_from_slice(&b[..]);
+                pages += 1;
+            }
+        }
+        std::fs::write(p, &d).expect("--pram");
+        println!("pram written back to {p} ({pages} pages)");
+    }
     if card_save {
         m.cpu.bus.io.esdhc.card.dirty = true;
         m.flush_card().expect("--card-save");
@@ -853,6 +953,18 @@ fn main() {
             println!("  BLOCKING sem_pend(0x{sem:08x}) at level {lv}, return 0x{ret:08x}: first at clock {t}, {n} times");
         }
     }
+    if let Some(h) = m.usb_host.as_mut() {
+        if let Some(w) = h.iso_sink.as_mut() {
+            use std::io::Write;
+            w.flush().expect("DTBOOT_USB_ISO");
+        }
+    }
+    for (lo, hi, hits, pcs) in &m.cpu.bus.wwatch {
+        let mut by: Vec<_> = pcs.iter().collect();
+        by.sort_by(|a, b| b.1.cmp(a.1));
+        let top: Vec<String> = by.iter().take(16).map(|(p, n)| format!("{p:08x}:{n}")).collect();
+        println!("watch-write: [{lo:08x}, {hi:08x}) {hits} writes; by pc {}", top.join(" "));
+    }
     if let Some(h) = &m.usb_host {
         if h.cdc {
             println!("usb serial in ({} bytes):\n{}", h.cdc_from_device.len(), String::from_utf8_lossy(&h.cdc_from_device));
@@ -873,9 +985,24 @@ fn main() {
         }
         println!("usb host: device descriptor {:02x?}", h.device_desc);
         println!("usb host: configuration ({} bytes) {:02x?}", h.config_desc.len(), h.config_desc);
+        if h.fs_iso {
+            for (t, s, r) in &h.ctl_results {
+                let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                match r {
+                    Ok(d) => println!("usb ctl: clock {t} setup {} ok, {} bytes in {}", hx(s), d.len(), hx(d)),
+                    Err(e) => println!("usb ctl: clock {t} setup {} FAILED: {e}", hx(s)),
+                }
+            }
+            let n: u64 = h.iso_sizes.values().sum();
+            println!("usb iso: {n} IN packets, sizes {:?}, over the queue head's size {}", h.iso_sizes, h.iso_oversize);
+        }
     }
     if let Some(s) = m.ob_link_report() {
         println!("{s}");
+    }
+    // what the MKI OS did to its parallel NOR flash in this run.
+    if let Some(n) = m.cpu.bus.nor.as_ref() {
+        println!("nor flash: {} word programs, {} erases", n.programs, n.erases);
     }
     let uo = &m.cpu.bus.io.usb_midi_out;
     if !uo.is_empty() {
@@ -999,6 +1126,11 @@ fn main() {
     }
     println!("icache: {} decodes, {} invalidating stores", m.cpu.bus.icache_decodes, m.cpu.bus.icache_invalidations);
     let c = &m.cpu;
+    let mut agg: Vec<_> = c.bus.watch_agg.iter().collect();
+    agg.sort();
+    for ((pc, o, n, w), k) in agg {
+        println!("watch-agg: pc={pc:08x} off={o:08x} n={n} {} x{k}", if *w { "w" } else { "r" });
+    }
     for (pc, a, n, v) in c.bus.watch_log.iter().take(40) {
         println!("watch: pc={pc:08x} [{a:08x}].{n} <- {v:08x}");
     }

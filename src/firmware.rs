@@ -243,6 +243,13 @@ impl Firmware {
     pub fn from_file(path: &std::path::Path) -> Result<Firmware> {
         let d = std::fs::read(path)
             .map_err(|e| Error::Syx(format!("cannot read {}: {e}", path.display())))?;
+        // an MKI's NOR dump (or a bare ELE2 container): the container the OS upgrade wrote
+        // (at 0x20000 on the Rytm MKI, after the bootstrap), booted as the bootstrap would boot it.
+        if d.first() != Some(&0xF0) {
+            if let Some(off) = d.windows(4).position(|w| w == b"ELE2") {
+                return Self::from_ele2(d[off..].to_vec());
+            }
+        }
         Self::from_syx_bytes(&d)
     }
 
