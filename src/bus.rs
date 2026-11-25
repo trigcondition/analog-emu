@@ -19,6 +19,9 @@ use crate::fast::Op;
 use crate::io::Io;
 use std::collections::{BTreeMap, HashMap};
 
+static RX_SIGNATURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static RX_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub const DDR_BASE: u32 = 0x4000_0000;
 pub const SRAM_BASE: u32 = 0x8000_0000;
 pub const SRAM_SIZE: usize = 0x1_0000;
@@ -105,6 +108,11 @@ pub struct Bus {
     pub watch_log: Vec<(u32, u32, u32, u32)>,
     /// The watchpoint also logs DDR reads (the CPU's; DMA is not seen).
     pub watch_reads: bool,
+    /// every hit of `watch` counted by (pc, DDR offset, size, write), no cap.
+    pub watch_agg: std::collections::HashMap<(u32, u32, u32, bool), u64>,
+    /// CPU write watches on DDR ranges ([lo, hi) as DDR offsets, `--watch-write`), with
+    /// their hit counts and the writing PCs (DMA is not seen, as for `watch`).
+    pub wwatch: Vec<(u32, u32, u64, std::collections::HashMap<u32, u64>)>,
     /// An SRAM write watchpoint: [lo, hi) as SRAM offsets, logged into
     /// `watch_log` as the DDR one. Seen by the interpreter only (compiled
     /// code stores to SRAM pages directly): run with DTEMU_NO_JIT=1.
@@ -175,6 +183,8 @@ impl Bus {
             watch_hits: 0,
             watch_log: Vec::new(),
             watch_reads: false,
+            watch_agg: Default::default(),
+            wwatch: Vec::new(),
             sram_watch: None,
             in_dma: false,
             blk_map: Vec::new(),
@@ -589,7 +599,7 @@ impl Bus {
             let c = self.cache.as_mut().unwrap();
             if let Some(v) = c.read(&mut self.ddr, self.ddr_mask, a, n) {
                 if self.watch_reads {
-                    self.check_watch(a, n, v);
+                    self.check_watch(a, n, v, false);
                 }
                 return v;
             }
@@ -603,7 +613,7 @@ impl Bus {
         if !self.in_dma && self.ddr_off(a).is_some() && self.ddr_off(a.wrapping_add(n - 1)).is_some() {
             let c = self.cache.as_mut().unwrap();
             if c.write(&mut self.ddr, self.ddr_mask, a, n, v) {
-                self.check_watch(a, n, v);
+                self.check_watch(a, n, v, true);
                 return;
             }
         }
@@ -648,7 +658,7 @@ impl Bus {
     fn read8_mem(&mut self, a: u32) -> u8 {
         if let Some(o) = self.ddr_off(a) {
             if self.watch_reads {
-                self.check_watch(a, 1, self.ddr[o] as u32);
+                self.check_watch(a, 1, self.ddr[o] as u32, false);
             }
             return self.ddr[o];
         }
@@ -664,7 +674,7 @@ impl Bus {
             if o + 2 <= self.ddr.len() {
                 let v = u16::from_be_bytes([self.ddr[o], self.ddr[o + 1]]);
                 if self.watch_reads {
-                    self.check_watch(a, 2, v as u32);
+                    self.check_watch(a, 2, v as u32, false);
                 }
                 return v;
             }
@@ -683,7 +693,7 @@ impl Bus {
             if o + 4 <= self.ddr.len() {
                 let v = u32::from_be_bytes(self.ddr[o..o + 4].try_into().unwrap());
                 if self.watch_reads {
-                    self.check_watch(a, 4, v);
+                    self.check_watch(a, 4, v, false);
                 }
                 return v;
             }
@@ -699,7 +709,10 @@ impl Bus {
     #[inline(always)]
     fn write8_mem(&mut self, a: u32, v: u8) {
         if let Some(o) = self.ddr_off(a) {
-            self.check_watch(a, 1, v as u32);
+            self.check_watch(a, 1, v as u32, true);
+            if !self.wwatch.is_empty() {
+                self.check_wwatch(a, 1);
+            }
             self.check_code(o as u32, 1);
             self.ddr[o] = v;
             return;
@@ -716,7 +729,10 @@ impl Bus {
     fn write16_mem(&mut self, a: u32, v: u16) {
         if let Some(o) = self.ddr_off(a) {
             if o + 2 <= self.ddr.len() {
-                self.check_watch(a, 2, v as u32);
+                self.check_watch(a, 2, v as u32, true);
+                if !self.wwatch.is_empty() {
+                    self.check_wwatch(a, 2);
+                }
                 self.check_code(o as u32, 2);
                 self.ddr[o..o + 2].copy_from_slice(&v.to_be_bytes());
                 return;
@@ -736,7 +752,10 @@ impl Bus {
     fn write32_mem(&mut self, a: u32, v: u32) {
         if let Some(o) = self.ddr_off(a) {
             if o + 4 <= self.ddr.len() {
-                self.check_watch(a, 4, v);
+                self.check_watch(a, 4, v, true);
+                if !self.wwatch.is_empty() {
+                    self.check_wwatch(a, 4);
+                }
                 self.check_code(o as u32, 4);
                 self.ddr[o..o + 4].copy_from_slice(&v.to_be_bytes());
                 return;
@@ -766,11 +785,23 @@ impl Bus {
     }
 
     #[inline(always)]
-    fn check_watch(&mut self, a: u32, n: u32, v: u32) {
+    fn check_wwatch(&mut self, a: u32, n: u32) {
+        let o = a & self.ddr_mask;
+        let pc = self.pc;
+        for w in self.wwatch.iter_mut() {
+            if o + n > w.0 && o < w.1 {
+                w.2 += 1;
+                *w.3.entry(pc).or_insert(0) += 1;
+            }
+        }
+    }
+
+    fn check_watch(&mut self, a: u32, n: u32, v: u32, w: bool) {
         if let Some((lo, hi)) = self.watch {
             let o = a & self.ddr_mask;
             if o + n > lo && o < hi {
                 self.watch_hits += 1;
+                *self.watch_agg.entry((self.pc, o, n, w)).or_insert(0) += 1;
                 if self.watch_log.len() < 4096 {
                     self.watch_log.push((self.pc, a, n, v));
                 }
@@ -859,7 +890,16 @@ impl Bus {
                     Some(v) => &v[..],
                     None => &self.sram[o..o + crate::analog::FRAME_LEN],
                 };
-                let out = an.frame(f, &dac, &self.sram[fx..fx + 24], inputs);
+                let mut out = an.frame(f, &dac, &self.sram[fx..fx + 24], inputs);
+                // DTEMU_RX_SIGNATURE=1 marks the MKI's ten receive words instead of the
+                // model's audio, (word + 1) << 18 | (frame & 0x3FF) << 8 (24-bit, positive, under the voices' x2): a USB map's
+                // order and every frame's place can be read back from the packets exactly.
+                if *RX_SIGNATURE.get_or_init(|| std::env::var_os("DTEMU_RX_SIGNATURE").is_some()) {
+                    let n = RX_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    for (w, x) in out.rx.iter_mut().take(10).enumerate() {
+                        *x = ((w as i32 + 1) << 18) | (((n & 0x3FF) as i32) << 8);
+                    }
+                }
                 if self.io.ssi0.on {
                     // The Rytm MKI's 10-word receive frame: words 0..5 on
                     // SSI0, 6..9 on SSI1 [inferred: the MKII's order].

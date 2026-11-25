@@ -42,6 +42,13 @@ fn main() {
                 println!("{:08x}: {}", addr + row, bytes.join(" "));
             }
         }
+        "save" => {
+            // save ADDR LEN FILE, the bytes as the bus reads them, raw
+            let addr = u32::from_str_radix(a[2].trim_start_matches("0x"), 16).unwrap();
+            let len: u32 = a[3].parse().unwrap();
+            let v: Vec<u8> = (0..len).map(|i| m.cpu.bus.peek8(addr + i)).collect();
+            std::fs::write(&a[4], v).unwrap();
+        }
         "find" => {
             // Every place in DDR and SRAM holding these bytes (at most 32).
             let pat: Vec<u8> = (0..a[2].len()).step_by(2).map(|i| u8::from_str_radix(&a[2][i..i + 2], 16).unwrap()).collect();
